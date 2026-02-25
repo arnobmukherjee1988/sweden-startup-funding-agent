@@ -1,16 +1,16 @@
 """
-Sweden Startup Funding Agent  — v3
+Sweden Startup Funding Agent  — v4
 ------------------------------------
-Daily digest of Swedish startup funding news, filtered to companies
-likely to hire Data Scientists, ML Engineers, Data Engineers, and
-Quantitative Analysts.
+Daily digest of Swedish company funding news for job seekers targeting
+Data Scientist, ML Engineer, Data Engineer, and Quant Analyst roles.
 
-v3 fixes:
-- Aggressive company name extraction with multi-step prefix stripping
-- Name normalisation before clustering (catches "Sweden's Lovable" == "Lovable")
-- Roundup / VC-fund / negative-news articles filtered out
-- Oslo/Norway-only articles excluded
-- Age window tightened to 90 days
+v4 changes:
+- Dropped Swedish-language sources (Breakit, DI Digital)
+- Added English specialist sources: EU-Startups, ArcticStartup, Silicon Canals, Tech.eu
+- Removed mandatory TECH_KEYWORDS filter — any funded Swedish company is relevant
+- Added Funding Amount + Round Type extraction (new email column)
+- Domain tags kept as informational labels only, not filters
+- Expanded infrastructure exclusions
 """
 
 import os
@@ -29,109 +29,120 @@ GMAIL_ADDRESS      = os.environ["GMAIL_ADDRESS"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 RECIPIENT_EMAIL    = GMAIL_ADDRESS
 
-MAX_AGE_DAYS = 90    # nothing older than 3 months
-FRESH_DAYS   = 3     # NEW badge threshold
+MAX_AGE_DAYS = 90
+FRESH_DAYS   = 3
 
-# ── Keyword lists ─────────────────────────────────────────────────────────────
+# ── Keyword filters ───────────────────────────────────────────────────────────
 
-# Must contain at least one TECH keyword
-TECH_KEYWORDS = [
-    "ai", "artificial intelligence", "machine learning", "deep learning",
-    "ml", "nlp", "natural language", "computer vision", "llm", "generative",
-    "data", "analytics", "data science", "big data", "data platform",
-    "fintech", "financial technology", "trading", "quantitative", "quant",
-    "algorithmic", "insurtech", "wealthtech", "regtech",
-    "saas", "software", "platform", "cloud", "api", "developer tools",
-    "cybersecurity", "security", "infosec",
-    "robotics", "automation", "iot",
-    "biotech", "medtech", "healthtech", "digital health",
-    "edtech", "legaltech", "proptech", "cleantech", "climatetech",
-    "blockchain", "crypto", "web3", "semiconductor", "chip",
-    "e-commerce", "marketplace", "tech", "technology", "digital",
-    "software-as-a-service", "deeptech", "quantum",
-]
-
-# Must contain at least one FUNDING keyword
 FUNDING_KEYWORDS = [
     "raises", "raised", "funding", "investment", "series a", "series b",
     "series c", "series d", "seed", "pre-seed", "venture", "capital",
-    "million", "miljon", "miljard", "finansiering", "investering",
-    "runda", "round", "backed", "secures", "secured", "closes", "closed",
-    "lands", "receives", "grant", "valuation",
+    "million", "secures", "secured", "closes", "closed", "backed",
+    "lands", "receives", "grant", "valuation", "round",
 ]
 
-# Must contain at least one SWEDEN keyword (strict — excludes Norway-only)
+# Geographic — must contain at least one (strict, no "nordic" alone)
 SWEDEN_KEYWORDS = [
     "sweden", "swedish", "stockholm", "gothenburg", "goteborg", "malmo",
-    "scandinavia", "sverige", "svensk", "linkoping", "uppsala",
-    "vasteras", "orebro", "helsingborg", "lund", "umea",
+    "sverige", "svensk", "linkoping", "uppsala", "vasteras", "orebro",
+    "helsingborg", "lund", "umea", "solleftea", "scandinavia",
 ]
 
-# Excluded domains
+# Physical infrastructure — not relevant for hiring data roles
 EXCLUDE_CONTENT_KEYWORDS = [
-    "plumbing", "carpentry", "carpenter", "pet grooming", "veterinary clinic",
-    "dental clinic", "dentist", "restaurant chain", "hair salon", "barbershop",
-    "construction firm", "real estate agency", "physical therapy", "massage",
-    "catering company",
+    "plumbing", "carpentry", "dental clinic", "dentist", "restaurant chain",
+    "hair salon", "barbershop", "physical therapy", "massage", "catering company",
+    "colocation", "hyperscaler", "megawatt", " mw ", "data center campus",
+    "construction permit", "grid connection",
 ]
 
-# ── Article-level quality filters ─────────────────────────────────────────────
+# ── Article quality filters ───────────────────────────────────────────────────
 
-# Titles matching these patterns are roundups/fund news/negative — excluded
 BAD_TITLE_PATTERNS = [
-    r"^top\s+\d+",                        # "Top 19 venture capital firms"
-    r"\d+\s+(?:startups?|companies)",      # "10 startups that..."
+    r"^top\s+\d+",
+    r"\d+\s+(?:startups?|companies)\s+(?:to|you|that)",
     r"venture capital firms",
     r"\bvc\s+firms\b",
-    r"slashes?\s+valuation",              # negative news
+    r"slashes?\s+valuation",
     r"cuts?\s+valuation",
     r"writes?\s+down",
-    r"more than\s+\w+\s+funding",         # industry aggregate
-    r"(?:micro\s+)?fund\s+to\s+back",     # VC fund launch
-    r"launches?\s+.*\bfund\b",            # "launches €21M micro fund"
-    r"raises?\s+.*\bfund\b",              # "raises third fund"
-    r"\binvestor\b.*\braises?\b",         # "investor X raises fund"
-    r"\bvc\b.*\braises?\b",
+    r"(?:micro\s+)?fund\s+to\s+back",
+    r"launches?\s+.{0,30}\bfund\b",
+    r"raises?\s+.{0,20}\b(?:third|second|fourth|new)\s+fund\b",
+    r"\binvestor\b.{0,30}\braises?\b",
     r"new\s+(?:micro\s+)?fund",
     r"nordic[\-\s]focused\s+fund",
     r"(?:annual|weekly|monthly)\s+(?:roundup|digest|report)",
-    r"startups?\s+(?:to\s+watch|you\s+should)",
+    r"startups?\s+(?:to\s+watch|you\s+should\s+know)",
+    r"^(?:swedish|nordic)\s+(?:ai[\-\s])?native\s+startups?",
 ]
 
-# If title contains these AND no specific company name follows, skip
-GENERIC_TITLE_PATTERNS = [
-    r"^swedish\s+(?:ai[\-\s])?native\s+startups?",
-    r"^sweden'?s?\s+(?:ai[\-\s])?native\s+startups?",
-    r"^nordic\s+startups?\s+",
-]
-
-# ── Domain tags ───────────────────────────────────────────────────────────────
+# ── Domain tags (informational only — not used as filters) ────────────────────
 DOMAIN_TAGS = {
-    "AI/ML":      ["ai", "machine learning", "deep learning", "llm", "nlp",
-                   "computer vision", "generative", "artificial intelligence"],
-    "Data":       ["data science", "data platform", "analytics", "big data",
-                   "data engineer", "data infrastructure"],
-    "Fintech":    ["fintech", "trading", "quantitative", "quant", "insurtech",
-                   "wealthtech", "financial technology"],
-    "SaaS/Cloud": ["saas", "cloud", "software", "platform", "api"],
-    "Cybersec":   ["cybersecurity", "security", "infosec"],
-    "HealthTech": ["healthtech", "medtech", "digital health", "biotech"],
-    "CleanTech":  ["cleantech", "climatetech"],
-    "Robotics":   ["robotics", "automation", "iot"],
-    "DeepTech":   ["deeptech", "quantum", "semiconductor", "chip"],
+    "AI/ML":        ["artificial intelligence", " ai ", "machine learning",
+                     "deep learning", "llm", "nlp", "computer vision", "generative ai"],
+    "Data":         ["data science", "data platform", "analytics", "big data",
+                     "data engineer", "data infrastructure"],
+    "Fintech":      ["fintech", "financial technology", "trading", "quantitative",
+                     "insurtech", "wealthtech", "regtech", "neobank", "payments"],
+    "SaaS/Cloud":   ["saas", " cloud ", "software platform", " api ", "developer tools"],
+    "Cybersec":     ["cybersecurity", "cyber security", "infosec"],
+    "HealthTech":   ["healthtech", "medtech", "digital health", "biotech", "life science"],
+    "CleanTech":    ["cleantech", "climatetech", "clean energy", "renewable", "sustainability"],
+    "Robotics":     ["robotics", "autonomous", " iot ", "internet of things"],
+    "DeepTech":     ["deeptech", "quantum", "semiconductor", "photonics", "chip"],
+    "Gaming":       ["gaming", "esports", "game studio", "betting", "igaming"],
+    "Logistics":    ["logistics", "supply chain", "last mile", "fleet"],
+    "Retail/Food":  ["e-commerce", "marketplace", "grocery", "food tech", "retail tech"],
+    "Energy":       ["energy tech", "grid", "power", "ev charging", "battery"],
 }
 
 TAG_COLOURS = {
-    "AI/ML":      ("#dbeafe", "#1d4ed8"),
-    "Data":       ("#dcfce7", "#15803d"),
-    "Fintech":    ("#fef9c3", "#854d0e"),
-    "SaaS/Cloud": ("#f3e8ff", "#7e22ce"),
-    "Cybersec":   ("#fee2e2", "#991b1b"),
-    "HealthTech": ("#ffedd5", "#c2410c"),
-    "CleanTech":  ("#d1fae5", "#065f46"),
-    "Robotics":   ("#e0f2fe", "#0369a1"),
-    "DeepTech":   ("#fce7f3", "#9d174d"),
+    "AI/ML":        ("#dbeafe", "#1d4ed8"),
+    "Data":         ("#dcfce7", "#15803d"),
+    "Fintech":      ("#fef9c3", "#854d0e"),
+    "SaaS/Cloud":   ("#f3e8ff", "#7e22ce"),
+    "Cybersec":     ("#fee2e2", "#991b1b"),
+    "HealthTech":   ("#ffedd5", "#c2410c"),
+    "CleanTech":    ("#d1fae5", "#065f46"),
+    "Robotics":     ("#e0f2fe", "#0369a1"),
+    "DeepTech":     ("#fce7f3", "#9d174d"),
+    "Gaming":       ("#fef3c7", "#92400e"),
+    "Logistics":    ("#f0fdf4", "#166534"),
+    "Retail/Food":  ("#fff7ed", "#9a3412"),
+    "Energy":       ("#ecfdf5", "#065f46"),
 }
+
+# ── Sources ───────────────────────────────────────────────────────────────────
+
+RSS_SOURCES = [
+    # Specialist Nordic / European startup outlets
+    ("https://www.eu-startups.com/feed/",    "EU-Startups"),
+    ("https://arcticstartup.com/feed/",      "ArcticStartup"),
+    ("https://siliconcanals.com/feed/",      "Silicon Canals"),
+    ("https://tech.eu/feed/",                "Tech.eu"),
+    ("https://sifted.eu/feed",               "Sifted"),
+]
+
+GOOGLE_NEWS_QUERIES = [
+    "Sweden+startup+funding",
+    "Swedish+startup+raises+million",
+    "Stockholm+startup+investment+round",
+    "Swedish+company+series+A+B+C+funding",
+    "Sweden+startup+seed+investment",
+    "Swedish+startup+secures+funding",
+    "Nordic+startup+Sweden+raises",
+]
+
+SOURCE_PRIORITY = {
+    "EU-Startups":    0,
+    "ArcticStartup":  1,
+    "Silicon Canals": 2,
+    "Sifted":         3,
+    "Tech.eu":        4,
+    "TechCrunch":     5,
+}
+
 
 # ── Scrapers ──────────────────────────────────────────────────────────────────
 
@@ -147,7 +158,7 @@ def fetch_google_news(query: str) -> list[dict]:
                 "link":      entry.get("link", "#"),
                 "published": entry.get("published_parsed", None),
                 "source":    entry.get("source", {}).get("title", "Google News"),
-                "summary":   summary[:500],
+                "summary":   summary[:600],
             })
         return results
     except Exception as exc:
@@ -159,14 +170,14 @@ def fetch_rss(url: str, source_name: str) -> list[dict]:
     try:
         feed = feedparser.parse(url)
         results = []
-        for entry in feed.entries[:25]:
+        for entry in feed.entries[:30]:
             summary = BeautifulSoup(entry.get("summary", ""), "html.parser").get_text()
             results.append({
                 "title":     entry.get("title", "").strip(),
                 "link":      entry.get("link", "#"),
                 "published": entry.get("published_parsed", None),
                 "source":    source_name,
-                "summary":   summary[:500],
+                "summary":   summary[:600],
             })
         return results
     except Exception as exc:
@@ -193,33 +204,21 @@ def age_days(pub: datetime | None) -> float:
 
 def format_date(pub: datetime | None) -> str:
     if pub is None:
-        return "Unknown date"
+        return "Unknown"
     return pub.strftime("%-d %b %Y")
 
 
 # ── Filters ───────────────────────────────────────────────────────────────────
 
 def is_bad_title(title: str) -> bool:
-    """Return True if the title looks like a roundup, VC fund, or negative article."""
     tl = title.lower()
-    for pat in BAD_TITLE_PATTERNS:
-        if re.search(pat, tl):
-            return True
-    for pat in GENERIC_TITLE_PATTERNS:
-        if re.search(pat, tl):
-            return True
-    return False
+    return any(re.search(p, tl) for p in BAD_TITLE_PATTERNS)
 
 
 def is_norway_only(article: dict) -> bool:
-    """Return True if the article is about a Norwegian company with no Swedish angle."""
     text = (article["title"] + " " + article["summary"]).lower()
-    norway_signals = ["oslo-based", "oslo based", "norwegian startup",
-                      "norway-based", "norway based"]
-    has_norway = any(s in text for s in norway_signals)
-    has_sweden = any(kw in text for kw in SWEDEN_KEYWORDS)
-    # Exclude if Norway is mentioned as headquarters but Sweden is absent
-    return has_norway and not has_sweden
+    norway = ["oslo-based", "oslo based", "norwegian startup", "norway-based"]
+    return any(s in text for s in norway) and not any(k in text for k in SWEDEN_KEYWORDS)
 
 
 def passes_filters(article: dict) -> bool:
@@ -232,8 +231,6 @@ def passes_filters(article: dict) -> bool:
         return False
     if not any(kw in text for kw in FUNDING_KEYWORDS):
         return False
-    if not any(kw in text for kw in TECH_KEYWORDS):
-        return False
     if any(kw in text for kw in EXCLUDE_CONTENT_KEYWORDS):
         return False
     if is_bad_title(article["title"]):
@@ -243,115 +240,134 @@ def passes_filters(article: dict) -> bool:
     return True
 
 
+# ── Funding extraction ────────────────────────────────────────────────────────
+
+_AMOUNT_RE = re.compile(
+    r"([€£\$])\s*([\d]+(?:[.,]\d+)?)\s*(k|m|mn|million|bn|billion)?"
+    r"|"
+    r"([\d]+(?:[.,]\d+)?)\s*(million|billion|m\b|bn\b|k\b)\s*(?:euro[s]?|dollar[s]?|usd|sek|kr)?",
+    re.IGNORECASE,
+)
+
+_ROUND_RE = re.compile(
+    r"\b(pre[\-\s]?seed|seed|series\s+[a-e]|growth\s+round|bridge\s+round|ipo|crowdfunding)\b",
+    re.IGNORECASE,
+)
+
+
+def extract_funding_info(title: str, summary: str) -> tuple[str, str]:
+    """Return (amount_str, round_str) e.g. ('€5M', 'Series A')."""
+    text = title + " " + summary
+
+    # Round type
+    round_str = ""
+    rm = _ROUND_RE.search(text)
+    if rm:
+        raw = rm.group(0).strip()
+        # Normalise capitalisation
+        raw = re.sub(r"series\s+([a-e])", lambda m: f"Series {m.group(1).upper()}", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"pre[\-\s]?seed", "Pre-Seed", raw, flags=re.IGNORECASE)
+        round_str = raw.title() if raw.lower() not in ("ipo",) else "IPO"
+
+    # Amount
+    amount_str = ""
+    am = _AMOUNT_RE.search(text)
+    if am:
+        try:
+            if am.group(1):                          # symbol-first: €5M
+                sym    = am.group(1)
+                num    = float(am.group(2).replace(",", "."))
+                unit   = (am.group(3) or "").lower()
+            else:                                    # number-first: 5 million euros
+                sym    = "€"
+                num    = float(am.group(4).replace(",", "."))
+                unit   = (am.group(5) or "").lower()
+
+            if unit in ("bn", "billion"):
+                amount_str = f"{sym}{num:g}B"
+            elif unit in ("m", "mn", "million"):
+                amount_str = f"{sym}{num:g}M"
+            elif unit == "k":
+                amount_str = f"{sym}{int(num)}K"
+            else:
+                amount_str = f"{sym}{num:g}"
+        except (ValueError, IndexError):
+            pass
+
+    return amount_str, round_str
+
+
+# ── Domain tags ───────────────────────────────────────────────────────────────
+
 def get_domain_tags(article: dict) -> list[str]:
-    text = (article["title"] + " " + article["summary"]).lower()
+    text = " " + (article["title"] + " " + article["summary"]).lower() + " "
     return [tag for tag, kws in DOMAIN_TAGS.items() if any(k in text for k in kws)]
 
 
 # ── Company name extraction ───────────────────────────────────────────────────
 
-# Prefixes stripped BEFORE the funding verb to isolate the real company name
 _PREFIX_RE = re.compile(
     r"""^(?:
         sweden'?s?\s+             |
         swedish\s+                |
         stockholm[\-\s]based\s+   |
         gothenburg[\-\s]based\s+  |
-        oslo[\-\s]based\s+        |
         nordic\s+                 |
         (?:ai|ml|data|tech|saas|fintech|deeptech|biotech|medtech|
-           cleantech|healthtech|nuclear|energy|software|hardware|
-           quantum|crypto)\s+
-        (?:startup|company|firm|scaleup|unicorn|platform)\s+ |
-        (?:startup|company|firm|scaleup)\s+                  |
-        prevention[\-\s]first\s+  |
-        [\w\-]+[\-\s]first\s+     |
-        [\w\-]+[\-\s]native\s+
+           cleantech|healthtech|quantum|crypto|gaming|energy)\s+
+        (?:startup|company|firm|scaleup|unicorn|platform)\s+  |
+        (?:startup|company|firm|scaleup)\s+                   |
+        [\w\-]+[\-\s](?:based|native|first)\s+
     )+""",
     re.IGNORECASE | re.VERBOSE,
 )
 
-# Descriptors that often appear between location tag and company name
-_DESCRIPTOR_RE = re.compile(
+_DESC_RE = re.compile(
     r"^(?:(?:ai|ml|data|b2b|b2c|saas|tech|green|digital|smart|autonomous|"
-    r"cloud|api|open[\-\s]source|open|next[\-\s]gen|next|deep|advanced|"
-    r"innovative|leading|pioneering|award[\-\s]winning|swedish|nordic|"
-    r"stockholm[\-\s]based|[\w]+[\-\s]based)\s+)*",
+    r"cloud|api|deep|advanced|innovative|leading|open[\-\s]source|next[\-\s]gen)\s+)*",
     re.IGNORECASE,
 )
 
 
 def extract_company_name(title: str) -> str:
-    """
-    Extract the actual company name from a funding headline.
-    Strategy:
-      1. Find text before the funding verb.
-      2. Strip location/descriptor prefixes.
-      3. If result is still long (> 4 words), take the last 1-2 tokens
-         (company names are usually at the END of descriptor chains).
-    """
-    # Step 1: isolate candidate before funding verb
     match = re.search(
         r"^(.*?)\s+(?:raises?|secures?|gets?|receives?|closes?|lands?|"
-        r"fetches?|announces?|backs?|backed|completes?)",
-        title,
-        re.IGNORECASE,
+        r"fetches?|announces?|backs?|backed|completes?|confirms?)",
+        title, re.IGNORECASE,
     )
     candidate = match.group(1).strip() if match else title[:60]
-
-    # Step 2: strip leading location/descriptor prefixes
     candidate = _PREFIX_RE.sub("", candidate).strip()
-    candidate = _DESCRIPTOR_RE.sub("", candidate).strip()
+    candidate = _DESC_RE.sub("", candidate).strip()
 
-    # Step 3: if still more than 4 words, take last 2 capitalised tokens
     words = candidate.split()
     if len(words) > 4:
-        cap_words = [w for w in words if w and w[0].isupper()]
-        candidate = " ".join(cap_words[-2:]) if cap_words else " ".join(words[-2:])
+        cap = [w for w in words if w and w[0].isupper()]
+        candidate = " ".join(cap[-2:]) if cap else " ".join(words[-2:])
 
     candidate = candidate.strip(" -–,.")
     return candidate if candidate and len(candidate) > 1 else title[:40]
 
 
 def normalize_for_cluster(name: str) -> str:
-    """
-    Strip all prefixes and lower-case for use as a clustering key.
-    Ensures "Sweden's Lovable", "Swedish AI startup Lovable", "Lovable" → "lovable"
-    """
     n = _PREFIX_RE.sub("", name).strip()
-    n = _DESCRIPTOR_RE.sub("", n).strip()
-    # Remove possessive / trailing punctuation
+    n = _DESC_RE.sub("", n).strip()
     n = re.sub(r"'s$", "", n).strip(" -–,.'\"")
     return n.lower()
 
 
 def linkedin_url(company_name: str) -> str:
-    return (
-        f"https://www.linkedin.com/search/results/companies/"
-        f"?keywords={quote(company_name)}"
-    )
+    return f"https://www.linkedin.com/search/results/companies/?keywords={quote(company_name)}"
 
 
 # ── Clustering ────────────────────────────────────────────────────────────────
 
-SOURCE_PRIORITY = {
-    "Breakit": 0,
-    "Dagens industri Digital": 1,
-    "EU-Startups": 2,
-    "ArcticStartup": 3,
-    "TechCrunch": 4,
-    "Silicon Canals": 5,
-}
-
-
 def cluster_by_company(articles: list[dict]) -> list[dict]:
     clusters: dict[str, list[dict]] = defaultdict(list)
     for a in articles:
-        key = normalize_for_cluster(a["company"])
-        clusters[key].append(a)
+        clusters[normalize_for_cluster(a["company"])].append(a)
 
     result = []
-    for key, group in clusters.items():
+    for group in clusters.values():
         group.sort(key=lambda x: SOURCE_PRIORITY.get(x["source"], 99))
         best = group[0].copy()
         best["coverage"] = len(group)
@@ -372,8 +388,8 @@ def build_html(articles: list[dict]) -> str:
 
         fresh_badge = (
             ' <span style="background:#22c55e;color:#fff;font-size:10px;'
-            'padding:1px 6px;border-radius:8px;vertical-align:middle;'
-            'font-weight:bold;margin-left:4px;">NEW</span>'
+            'padding:1px 6px;border-radius:8px;font-weight:bold;'
+            'vertical-align:middle;margin-left:4px;">NEW</span>'
             if days_old <= FRESH_DAYS else ""
         )
         coverage_note = (
@@ -381,28 +397,55 @@ def build_html(articles: list[dict]) -> str:
             if a.get("coverage", 1) > 1 else ""
         )
 
+        # Funding column
+        amount, rnd = a.get("amount", ""), a.get("round", "")
+        funding_parts = []
+        if rnd:
+            funding_parts.append(
+                f'<span style="font-weight:600;color:#374151;">{rnd}</span>'
+            )
+        if amount:
+            funding_parts.append(
+                f'<span style="color:#059669;font-weight:700;">{amount}</span>'
+            )
+        funding_html = (
+            ' <span style="color:#d1d5db;font-size:11px;">·</span> '.join(funding_parts)
+            if funding_parts else
+            '<span style="color:#d1d5db;font-size:11px;">—</span>'
+        )
+
+        # Domain tags
         tags_html = ""
         for t in a.get("tags", []):
             bg, fg = TAG_COLOURS.get(t, ("#f3f4f6", "#374151"))
             tags_html += (
                 f'<span style="background:{bg};color:{fg};font-size:10px;'
-                f'padding:2px 7px;border-radius:8px;white-space:nowrap;'
-                f'margin-right:3px;font-weight:600;display:inline-block;'
-                f'margin-bottom:2px;">{t}</span>'
+                f'padding:2px 6px;border-radius:7px;white-space:nowrap;'
+                f'margin-right:3px;margin-bottom:2px;font-weight:600;'
+                f'display:inline-block;">{t}</span>'
             )
         if not tags_html:
-            tags_html = '<span style="color:#d1d5db;font-size:11px;">—</span>'
+            tags_html = '<span style="color:#e5e7eb;font-size:11px;">—</span>'
+
+        li_url = a.get("linkedin_url", "#")
 
         rows += f"""
         <tr style="border-bottom:1px solid #f3f4f6;">
           <td style="padding:11px 14px;vertical-align:top;min-width:120px;">
-            <a href="{a['linkedin_url']}" target="_blank"
-               title="Search {a['company']} on LinkedIn"
-               style="color:#1d4ed8;font-weight:700;text-decoration:none;
-                      border-bottom:1px solid #bfdbfe;">{a['company']}</a>
+            <span style="font-weight:700;color:#111827;">{a['company']}</span>
             {fresh_badge}{coverage_note}
+            <br>
+            <a href="{li_url}" target="_blank"
+               style="font-size:11px;color:#6b7280;text-decoration:none;">
+              🔗 LinkedIn search
+            </a>
           </td>
-          <td style="padding:11px 14px;vertical-align:top;min-width:110px;">{tags_html}</td>
+          <td style="padding:11px 14px;vertical-align:top;min-width:110px;white-space:nowrap;">
+            {funding_html}
+          </td>
+          <td style="padding:11px 14px;vertical-align:top;min-width:110px;">
+            {tags_html}
+          </td>
           <td style="padding:11px 14px;vertical-align:top;font-size:13px;">
             <a href="{a['link']}" target="_blank"
                style="color:#374151;text-decoration:none;">{a['title']}</a>
@@ -413,19 +456,16 @@ def build_html(articles: list[dict]) -> str:
                      color:#6b7280;white-space:nowrap;">{format_date(pub)}</td>
         </tr>"""
 
-    no_results = """<tr><td colspan="5"
+    no_results = """<tr><td colspan="6"
         style="padding:32px;text-align:center;color:#9ca3af;font-size:14px;">
         No new funding news matching your criteria today — check back tomorrow!
         </td></tr>""" if not articles else ""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-</head>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:20px;background:#f3f4f6;font-family:Arial,sans-serif;">
-<div style="max-width:960px;margin:auto;background:#fff;border-radius:12px;
+<div style="max-width:1060px;margin:auto;background:#fff;border-radius:12px;
             overflow:hidden;box-shadow:0 2px 16px rgba(0,0,0,.08);">
 
   <div style="background:#0d1b2a;color:#fff;padding:28px 32px;">
@@ -434,14 +474,14 @@ def build_html(articles: list[dict]) -> str:
     </h1>
     <p style="margin:0;opacity:.65;font-size:13px;">
       {today} &nbsp;·&nbsp; {count} unique compan{'ies' if count != 1 else 'y'}
-      &nbsp;·&nbsp; Filtered for Data · AI/ML · Fintech · SaaS · DeepTech
+      &nbsp;·&nbsp; Any domain · All roles: Data · ML · Engineering · Quant
     </p>
   </div>
 
   <div style="background:#eff6ff;border-bottom:1px solid #dbeafe;
               padding:10px 32px;font-size:12px;color:#1d4ed8;">
-    💡 <strong>Click any company name</strong> to search it on LinkedIn and find
-    hiring managers, founders, and open roles.
+    💡 Company name shows the extracted name &nbsp;·&nbsp;
+    Click <strong>LinkedIn search</strong> below each name to find founders and hiring managers
   </div>
 
   <div style="overflow-x:auto;">
@@ -449,7 +489,9 @@ def build_html(articles: list[dict]) -> str:
       <thead>
         <tr style="background:#f9fafb;border-bottom:2px solid #e5e7eb;">
           <th style="padding:10px 14px;text-align:left;color:#6b7280;font-size:11px;
-                     text-transform:uppercase;letter-spacing:.06em;">Company</th>
+                     text-transform:uppercase;letter-spacing:.06em;white-space:nowrap;">Company</th>
+          <th style="padding:10px 14px;text-align:left;color:#6b7280;font-size:11px;
+                     text-transform:uppercase;letter-spacing:.06em;white-space:nowrap;">Round · Amount</th>
           <th style="padding:10px 14px;text-align:left;color:#6b7280;font-size:11px;
                      text-transform:uppercase;letter-spacing:.06em;">Domain</th>
           <th style="padding:10px 14px;text-align:left;color:#6b7280;font-size:11px;
@@ -460,21 +502,17 @@ def build_html(articles: list[dict]) -> str:
                      text-transform:uppercase;letter-spacing:.06em;">Date</th>
         </tr>
       </thead>
-      <tbody>
-        {rows or no_results}
-      </tbody>
+      <tbody>{rows or no_results}</tbody>
     </table>
   </div>
 
   <div style="background:#f9fafb;padding:16px 32px;font-size:12px;
               color:#9ca3af;border-top:1px solid #f3f4f6;">
-    🤖 Sweden Startup Funding Agent v3 &nbsp;·&nbsp;
-    Target roles: Data Scientist · ML Engineer · Data Engineer · Quant Analyst
+    🤖 Sweden Startup Funding Agent v4 &nbsp;·&nbsp;
+    Sources: EU-Startups · ArcticStartup · Silicon Canals · Sifted · Tech.eu · Google News
   </div>
-
 </div>
-</body>
-</html>"""
+</body></html>"""
 
 
 # ── Email sender ──────────────────────────────────────────────────────────────
@@ -489,7 +527,6 @@ def send_email(html: str, count: int) -> None:
     msg["From"]    = GMAIL_ADDRESS
     msg["To"]      = RECIPIENT_EMAIL
     msg.attach(MIMEText(html, "html"))
-
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
         server.sendmail(GMAIL_ADDRESS, RECIPIENT_EMAIL, msg.as_string())
@@ -499,41 +536,37 @@ def send_email(html: str, count: int) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    print(f"🚀 Agent v3 — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"🚀 Agent v4 — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
     raw: list[dict] = []
 
-    for query in [
-        "Sweden+startup+funding",
-        "Swedish+startup+raises+million",
-        "Stockholm+startup+investment+round",
-        "Nordic+AI+startup+funding+Sweden",
-        "Sverige+tech+startup+finansiering",
-        "Sweden+fintech+raises",
-        "Swedish+SaaS+investment",
-        "Sweden+deeptech+funding",
-        "Swedish+startup+series+A+B+C",
-    ]:
+    # Specialist English-language RSS feeds
+    for url, name in RSS_SOURCES:
+        articles = fetch_rss(url, name)
+        print(f"  [{name}] {len(articles)} articles")
+        raw.extend(articles)
+
+    # Google News as a broad catch-all
+    for query in GOOGLE_NEWS_QUERIES:
         raw.extend(fetch_google_news(query))
 
-    raw.extend(fetch_rss("https://www.breakit.se/feed/articles",  "Breakit"))
-    raw.extend(fetch_rss("https://digital.di.se/rss",             "Dagens industri Digital"))
-
-    print(f"📥 {len(raw)} raw articles fetched")
+    print(f"📥 {len(raw)} raw articles")
 
     filtered = [a for a in raw if passes_filters(a)]
     print(f"🔍 {len(filtered)} after filters")
 
+    # Enrich
     for a in filtered:
         a["company"]      = extract_company_name(a["title"])
         a["linkedin_url"] = linkedin_url(a["company"])
         a["tags"]         = get_domain_tags(a)
+        a["amount"], a["round"] = extract_funding_info(a["title"], a["summary"])
 
     clustered = cluster_by_company(filtered)
     clustered.sort(key=lambda x: age_days(to_datetime(x["published"])))
     final = clustered[:30]
 
-    print(f"📰 {len(final)} unique companies after clustering")
+    print(f"📰 {len(final)} unique companies in digest")
 
     html = build_html(final)
     send_email(html, len(final))
