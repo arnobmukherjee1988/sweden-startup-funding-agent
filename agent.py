@@ -1,26 +1,22 @@
 """
-Sweden Startup Funding Agent  — v5
-------------------------------------
+Sweden Startup Funding Agent  — v6 (Gemini-enhanced)
+------------------------------------------------------
 Daily digest of Swedish company funding news for job seekers targeting
 Data Scientist, ML Engineer, Data Engineer, and Quant Analyst roles.
 
-v5 fixes over v4:
-- FIX 1: Normalise Unicode apostrophes before regex (fixes Flox Intelligence duplicate)
-- FIX 2: Extended funding verb list — "powers", "emerges", "extends", "closes", "bags"
-         (fixes Elvy duplicate and similar cases)
-- FIX 3: Word-count truncation threshold lowered 4→2, more descriptors added
-         (fixes "pet InsurTech Lassie" → "Lassie")
-- FIX 4: "nuclear", "bio" added to domain prefix list
-         (fixes "Nuclear Startup Blykalla" → "Blykalla")
-- FIX 5: Valuation-milestone titles filtered out — "triples/doubles/reaches valuation"
-         (removes Lovable valuation story from digest)
-- BONUS: Domain tag keywords broadened for better coverage
+v6 changes over v5:
+- Gemini 2.0 Flash replaces BAD_TITLE_PATTERNS regex for relevance filtering
+- Gemini 2.0 Flash replaces regex chain for company name extraction
+- Both have full regex fallbacks if Gemini is unavailable or errors
+- GEMINI_API_KEY loaded from environment (GitHub Secret)
 """
 
 import os
 import re
+import time
 import smtplib
 import feedparser
+import google.generativeai as genai
 from bs4 import BeautifulSoup
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -35,6 +31,17 @@ RECIPIENT_EMAIL    = GMAIL_ADDRESS
 
 MAX_AGE_DAYS = 90
 FRESH_DAYS   = 3
+
+# ── Gemini setup ──────────────────────────────────────────────────────────────
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    _gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+    print("✅ Gemini 2.0 Flash initialised")
+else:
+    _gemini_model = None
+    print("⚠️  GEMINI_API_KEY not set — falling back to regex for all decisions")
 
 # ── Keyword filters ───────────────────────────────────────────────────────────
 
@@ -59,7 +66,7 @@ EXCLUDE_CONTENT_KEYWORDS = [
     "construction permit", "grid connection",
 ]
 
-# ── Article quality filters ───────────────────────────────────────────────────
+# ── Regex fallbacks (used when Gemini is unavailable) ─────────────────────────
 
 BAD_TITLE_PATTERNS = [
     r"^top\s+\d+",
@@ -69,7 +76,6 @@ BAD_TITLE_PATTERNS = [
     r"slashes?\s+valuation",
     r"cuts?\s+valuation",
     r"writes?\s+down",
-    # FIX 5 — valuation milestone stories are not new funding rounds
     r"triples?\s+valuation",
     r"doubles?\s+valuation",
     r"quadruples?\s+valuation",
@@ -226,9 +232,76 @@ def format_date(pub: datetime | None) -> str:
         return "Unknown"
     return pub.strftime("%-d %b %Y")
 
+# ── Gemini helpers ────────────────────────────────────────────────────────────
+
+def _gemini_call(prompt: str) -> str | None:
+    """
+    Single Gemini API call. Returns response text or None on error.
+    A short sleep is added after each call to respect rate limits.
+    """
+    try:
+        response = _gemini_model.generate_content(prompt)
+        time.sleep(0.5)          # ~120 RPM max — well within any tier limit
+        return response.text.strip()
+    except Exception as exc:
+        print(f"[Gemini] API error: {exc}")
+        time.sleep(1)            # back off briefly after an error
+        return None
+
+
+def is_relevant_article_llm(title: str) -> bool:
+    """
+    Returns True if the headline reports a new funding round / investment
+    for a specific named company.
+
+    Uses Gemini 2.0 Flash when available; falls back to BAD_TITLE_PATTERNS
+    regex when Gemini is unavailable.
+    """
+    if _gemini_model is None:
+        return not is_bad_title(title)
+
+    prompt = (
+        "Does this headline report a NEW funding round, investment, or fundraise "
+        "completed by a specific named company?\n"
+        "Answer ONLY 'Yes' or 'No'. No explanation.\n\n"
+        f"Headline: {title}"
+    )
+    answer = _gemini_call(prompt)
+    if answer is None:
+        return not is_bad_title(title)   # fallback
+    return answer.lower().startswith("yes")
+
+
+def extract_company_name_llm(title: str) -> str:
+    """
+    Extracts the company name receiving funding from the headline.
+
+    Uses Gemini 2.0 Flash when available; falls back to regex chain
+    when Gemini is unavailable or returns an implausible result.
+    """
+    if _gemini_model is None:
+        return extract_company_name(title)
+
+    prompt = (
+        "What is the exact name of the company that received funding in this headline?\n"
+        "Return ONLY the company name — no punctuation, no explanation, "
+        "no descriptors like 'startup' or 'Swedish'.\n\n"
+        f"Headline: {title}"
+    )
+    answer = _gemini_call(prompt)
+
+    # Sanity checks: non-empty, single line, not absurdly long
+    if answer and "\n" not in answer and 1 < len(answer) < 60:
+        return answer
+
+    # Fallback if Gemini returned something implausible
+    print(f"[Gemini name] Implausible result '{answer}' — using regex fallback")
+    return extract_company_name(title)
+
 # ── Filters ───────────────────────────────────────────────────────────────────
 
 def is_bad_title(title: str) -> bool:
+    """Regex-based fallback relevance filter (used when Gemini is unavailable)."""
     tl = title.lower()
     return any(re.search(p, tl) for p in BAD_TITLE_PATTERNS)
 
@@ -239,7 +312,11 @@ def is_norway_only(article: dict) -> bool:
     return any(s in text for s in norway) and not any(k in text for k in SWEDEN_KEYWORDS)
 
 
-def passes_filters(article: dict) -> bool:
+def passes_basic_filters(article: dict) -> bool:
+    """
+    Fast keyword-only pre-filter — no API calls.
+    Articles that fail here are dropped immediately.
+    """
     text = (article["title"] + " " + article["summary"]).lower()
     pub  = to_datetime(article["published"])
     if age_days(pub) > MAX_AGE_DAYS:
@@ -249,8 +326,6 @@ def passes_filters(article: dict) -> bool:
     if not any(kw in text for kw in FUNDING_KEYWORDS):
         return False
     if any(kw in text for kw in EXCLUDE_CONTENT_KEYWORDS):
-        return False
-    if is_bad_title(article["title"]):
         return False
     if is_norway_only(article):
         return False
@@ -317,14 +392,12 @@ def get_domain_tags(article: dict) -> list[str]:
     text = " " + (article["title"] + " " + article["summary"]).lower() + " "
     return [tag for tag, kws in DOMAIN_TAGS.items() if any(k in text for k in kws)]
 
-# ── Company name extraction ───────────────────────────────────────────────────
+# ── Company name extraction — regex chain (fallback) ─────────────────────────
 
-# FIX 1 helper: normalise Unicode apostrophes to ASCII before regex matching
 def _normalise_apostrophes(s: str) -> str:
     return s.replace("\u2019", "'").replace("\u2018", "'").replace("\u02bc", "'")
 
 
-# FIX 4: "nuclear", "bio", "insurtech", "pet" added to domain prefix list
 _PREFIX_RE = re.compile(
     r"""^(?:
         sweden'?s?\s+               |
@@ -350,7 +423,6 @@ _DESC_RE = re.compile(
     re.IGNORECASE,
 )
 
-# FIX 2: extended funding verb list
 _FUNDING_VERB_RE = re.compile(
     r"\s+(?:raises?|secures?|gets?|receives?|closes?|lands?|fetches?|"
     r"announces?|backs?|backed|completes?|confirms?|bags?|attracts?|"
@@ -361,7 +433,7 @@ _FUNDING_VERB_RE = re.compile(
 
 
 def extract_company_name(title: str) -> str:
-    # FIX 1: normalise apostrophes first
+    """Regex-based company name extraction (used as Gemini fallback)."""
     title_n = _normalise_apostrophes(title)
 
     match = _FUNDING_VERB_RE.search(title_n)
@@ -371,7 +443,6 @@ def extract_company_name(title: str) -> str:
     candidate = _DESC_RE.sub("", candidate).strip()
 
     words = candidate.split()
-    # FIX 3: threshold lowered from 4 to 2 — catches "pet InsurTech Lassie" etc.
     if len(words) > 2:
         cap = [w for w in words if w and w[0].isupper()]
         candidate = " ".join(cap[-2:]) if cap else " ".join(words[-2:])
@@ -381,7 +452,6 @@ def extract_company_name(title: str) -> str:
 
 
 def normalize_for_cluster(name: str) -> str:
-    # FIX 1: normalise apostrophes before applying prefix regex
     n = _normalise_apostrophes(name)
     n = _PREFIX_RE.sub("", n).strip()
     n = _DESC_RE.sub("", n).strip()
@@ -415,6 +485,7 @@ def cluster_by_company(articles: list[dict]) -> list[dict]:
 def build_html(articles: list[dict]) -> str:
     today = datetime.now().strftime("%A, %d %B %Y")
     count = len(articles)
+    mode  = "Gemini 2.0 Flash" if _gemini_model else "regex fallback"
 
     rows = ""
     for a in articles:
@@ -534,7 +605,7 @@ def build_html(articles: list[dict]) -> str:
 
   <div style="background:#f9fafb;padding:16px 32px;font-size:12px;
               color:#9ca3af;border-top:1px solid #f3f4f6;">
-    🤖 Sweden Startup Funding Agent v5 &nbsp;·&nbsp;
+    🤖 Sweden Startup Funding Agent v6 ({mode}) &nbsp;·&nbsp;
     Sources: EU-Startups · ArcticStartup · Silicon Canals · Sifted · Tech.eu · Google News
   </div>
 </div>
@@ -560,7 +631,7 @@ def send_email(html: str, count: int) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    print(f"🚀 Agent v5 — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"🚀 Agent v6 — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
     raw: list[dict] = []
 
@@ -574,16 +645,40 @@ def main() -> None:
 
     print(f"📥 {len(raw)} raw articles")
 
-    filtered = [a for a in raw if passes_filters(a)]
-    print(f"🔍 {len(filtered)} after filters")
+    # Step 1: fast keyword pre-filter (no API calls)
+    pre_filtered = [a for a in raw if passes_basic_filters(a)]
+    print(f"🔍 {len(pre_filtered)} after basic keyword filters")
 
-    for a in filtered:
-        a["company"]      = extract_company_name(a["title"])
+    # Step 2: deduplicate by URL before Gemini calls (saves API quota)
+    seen_urls: set[str] = set()
+    unique = []
+    for a in pre_filtered:
+        if a["link"] not in seen_urls:
+            seen_urls.add(a["link"])
+            unique.append(a)
+    print(f"🔗 {len(unique)} after URL deduplication")
+
+    # Step 3: Gemini relevance filter (or regex fallback)
+    print(f"🤖 Running relevance check ({len(unique)} articles)...")
+    relevant = []
+    for a in unique:
+        if is_relevant_article_llm(a["title"]):
+            relevant.append(a)
+        else:
+            print(f"  ✗ Dropped: {a['title'][:80]}")
+    print(f"✅ {len(relevant)} relevant articles")
+
+    # Step 4: enrich — Gemini company name (or regex fallback) + tags + funding info
+    print(f"🏷️  Extracting company names ({len(relevant)} articles)...")
+    for a in relevant:
+        a["company"]      = extract_company_name_llm(a["title"])
         a["linkedin_url"] = linkedin_url(a["company"])
         a["tags"]         = get_domain_tags(a)
         a["amount"], a["round"] = extract_funding_info(a["title"], a["summary"])
+        print(f"  → {a['company']!r:30s}  {a['title'][:60]}")
 
-    clustered = cluster_by_company(filtered)
+    # Step 5: cluster duplicates, sort, cap at 30
+    clustered = cluster_by_company(relevant)
     clustered.sort(key=lambda x: age_days(to_datetime(x["published"])))
     final = clustered[:30]
 
