@@ -543,6 +543,37 @@ def linkedin_url(company_name: str) -> str:
         f"?keywords={quote(company_name)}"
     )
 
+# ── Invalid company name guard ────────────────────────────────────────────────
+# When Gemini is unavailable the regex sometimes extracts a funding-round term
+# ("Series A", "Seed", "Pre-Seed") as the company name.  These articles are
+# useless in the digest and must be dropped before clustering.
+
+_INVALID_COMPANY_RE = re.compile(
+    r"^(?:pre[\-\s]?seed|seed|series\s+[a-e]|bridge\s+round|growth\s+round"
+    r"|ipo|crowdfunding|round|funding\s+round)$",
+    re.IGNORECASE,
+)
+
+
+def is_invalid_company_name(name: str) -> bool:
+    return bool(_INVALID_COMPANY_RE.match(name.strip()))
+
+
+# ── Denmark target domains ─────────────────────────────────────────────────────
+# The Denmark section is filtered to companies in sectors likely to hire
+# Data Scientists, ML / AI Engineers, and Data Engineers.
+# Sweden is kept broad (user's preference).
+
+DENMARK_TARGET_DOMAINS = {
+    "AI/ML", "Data", "Fintech", "SaaS/Cloud",
+    "Cybersec", "HealthTech", "DeepTech", "Robotics",
+    # Energy and CleanTech platforms hire Data Scientists, ML Engineers, and
+    # Data Engineers heavily for grid optimisation, demand forecasting, and
+    # algorithmic energy trading — same profile as Flower, Polarium, ATO Energy
+    # in Sweden.
+    "Energy", "CleanTech",
+}
+
 # ── Clustering ────────────────────────────────────────────────────────────────
 
 def cluster_by_company(articles: list[dict]) -> list[dict]:
@@ -799,8 +830,9 @@ def build_html(sweden_articles: list[dict], denmark_articles: list[dict]) -> str
   <!-- ── Footer ── -->
   <div style="background:#f9fafb;padding:16px 32px;font-size:12px;
               color:#9ca3af;border-top:1px solid #f3f4f6;">
-    🤖 Nordic Startup Funding Agent v7 ({mode}) &nbsp;·&nbsp;
-    Sources: EU-Startups · ArcticStartup · Silicon Canals · Sifted · Tech.eu · Google News
+    🤖 Nordic Startup Funding Agent v8 ({mode}) &nbsp;·&nbsp;
+    Sources: ArcticStartup · Nordic Startup News · Silicon Canals · Tech.eu ·
+    Tech Funding News · TechCrunch · FinSMEs · Sifted · EU-Startups · Google News
   </div>
 
 </div>
@@ -869,20 +901,36 @@ def main() -> None:
 
     # Step 4: enrich — company name, tags, funding info, country tag
     print(f"🏷️  Extracting company names ({len(relevant)} articles)...")
+    enriched = []
     for a in relevant:
         a["company"]      = extract_company_name_llm(a["title"])
         a["linkedin_url"] = linkedin_url(a["company"])
         a["tags"]         = get_domain_tags(a)
         a["amount"], a["round"] = extract_funding_info(a["title"], a["summary"])
         a["country"]      = get_article_country(a)
+        if is_invalid_company_name(a["company"]):
+            print(f"  ✗ Bad company name {a['company']!r} — dropping: {a['title'][:60]}")
+            continue
+        enriched.append(a)
         print(f"  → {a['company']!r:30s} [{a['country']:6s}]  {a['title'][:50]}")
+    print(f"✅ {len(enriched)} articles after invalid-name filter")
 
     # Step 5: cluster duplicates
-    clustered = cluster_by_company(relevant)
+    clustered = cluster_by_company(enriched)
 
     # Step 6: split by country, sort by recency, cap at 30 each
     sweden_list  = [a for a in clustered if a.get("country") in ("sweden",  "both")]
     denmark_list = [a for a in clustered if a.get("country") in ("denmark", "both")]
+
+    # Denmark: keep only companies in sectors relevant to Data / ML / AI / Engineering roles
+    denmark_list = [
+        a for a in denmark_list
+        if any(tag in DENMARK_TARGET_DOMAINS for tag in a.get("tags", []))
+    ]
+    print(
+        f"🇩🇰 {len(denmark_list)} Danish companies after domain filter"
+        f" ({', '.join(sorted(DENMARK_TARGET_DOMAINS))})"
+    )
 
     sweden_list.sort( key=lambda x: age_days(to_datetime(x["published"])))
     denmark_list.sort(key=lambda x: age_days(to_datetime(x["published"])))
