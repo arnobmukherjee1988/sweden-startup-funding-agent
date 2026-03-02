@@ -163,11 +163,17 @@ TAG_COLOURS = {
 # ── Sources ───────────────────────────────────────────────────────────────────
 
 RSS_SOURCES = [
-    ("https://www.eu-startups.com/feed/",  "EU-Startups"),
-    ("https://arcticstartup.com/feed/",    "ArcticStartup"),
-    ("https://siliconcanals.com/feed/",    "Silicon Canals"),
-    ("https://tech.eu/feed/",              "Tech.eu"),
-    ("https://sifted.eu/feed",             "Sifted"),
+    # ── Free sources (preferred) ───────────────────────────────────────────────
+    ("https://arcticstartup.com/feed/",          "ArcticStartup"),       # Nordic-focused, free
+    ("https://nordicstartupnews.com/feed/",       "Nordic Startup News"), # Nordic-focused, free, non-profit
+    ("https://siliconcanals.com/feed/",           "Silicon Canals"),      # European, free
+    ("https://tech.eu/feed/",                     "Tech.eu"),             # European, free
+    ("https://techfundingnews.com/feed/",         "Tech Funding News"),   # Global, free
+    ("https://techcrunch.com/feed/",              "TechCrunch"),          # Global, free
+    ("https://www.finsmes.com/feed",              "FinSMEs"),             # Global VC/funding, free
+    ("https://sifted.eu/feed",                    "Sifted"),              # European, free
+    # ── Paywalled (kept for data coverage; link de-prioritised) ───────────────
+    ("https://www.eu-startups.com/feed/",         "EU-Startups"),         # Paywalled — fallback only
 ]
 
 GOOGLE_NEWS_QUERIES = [
@@ -190,12 +196,18 @@ DENMARK_GOOGLE_NEWS_QUERIES = [
 ]
 
 SOURCE_PRIORITY = {
-    "EU-Startups":    0,
-    "ArcticStartup":  1,
-    "Silicon Canals": 2,
-    "Sifted":         3,
-    "Tech.eu":        4,
-    "TechCrunch":     5,
+    # Lower number = preferred link shown in the email.
+    # When multiple sources cover the same company, the lowest-numbered one wins.
+    # EU-Startups is paywalled so it sits last; all other sources are free.
+    "ArcticStartup":       0,   # Nordic-specific, free
+    "Nordic Startup News": 1,   # Nordic-specific, free, non-profit
+    "Silicon Canals":      2,   # European, free
+    "Tech.eu":             3,   # European, free
+    "Tech Funding News":   4,   # Global, free
+    "TechCrunch":          5,   # Global, free
+    "FinSMEs":             6,   # Global VC/funding, free
+    "Sifted":              7,   # European, free
+    "EU-Startups":         8,   # Paywalled — fallback only
 }
 
 # ── Scrapers ──────────────────────────────────────────────────────────────────
