@@ -1,14 +1,16 @@
 """
-Sweden Startup Funding Agent  — v6 (Gemini-enhanced)
-------------------------------------------------------
-Daily digest of Swedish company funding news for job seekers targeting
+Nordic Startup Funding Agent  — v7
+-----------------------------------
+Daily digest of Swedish and Danish startup funding news for job seekers targeting
 Data Scientist, ML Engineer, Data Engineer, and Quant Analyst roles.
 
-v6 changes over v5:
-- Gemini 2.0 Flash replaces BAD_TITLE_PATTERNS regex for relevance filtering
-- Gemini 2.0 Flash replaces regex chain for company name extraction
-- Both have full regex fallbacks if Gemini is unavailable or errors
-- GEMINI_API_KEY loaded from environment (GitHub Secret)
+v7 changes over v6:
+- Added Denmark as a second country section (Sweden first, Denmark second)
+- Fully mobile-responsive email: CSS media queries + card layout for phones
+- Country tagging: articles classified as 'sweden', 'denmark', or 'both'
+- SEK / DKK / kr currency support added to amount parser
+- Updated subject line to reflect both countries
+- Regex fallbacks unchanged
 """
 
 import os
@@ -59,6 +61,12 @@ SWEDEN_KEYWORDS = [
     "helsingborg", "lund", "umea", "solleftea", "scandinavia",
 ]
 
+DENMARK_KEYWORDS = [
+    "denmark", "danish", "copenhagen", "københavn", "kobenhavn",
+    "aarhus", "odense", "aalborg", "frederiksberg", "esbjerg",
+    "randers", "vejle", "kolding", "horsens", "dansk",
+]
+
 EXCLUDE_CONTENT_KEYWORDS = [
     "plumbing", "carpentry", "dental clinic", "dentist", "restaurant chain",
     "hair salon", "barbershop", "physical therapy", "massage", "catering company",
@@ -90,7 +98,7 @@ BAD_TITLE_PATTERNS = [
     r"nordic[\-\s]focused\s+fund",
     r"(?:annual|weekly|monthly)\s+(?:roundup|digest|report)",
     r"startups?\s+(?:to\s+watch|you\s+should\s+know)",
-    r"^(?:swedish|nordic)\s+(?:ai[\-\s])?native\s+startups?",
+    r"^(?:swedish|nordic|danish)\s+(?:ai[\-\s])?native\s+startups?",
 ]
 
 # ── Domain tags (informational only) ─────────────────────────────────────────
@@ -159,6 +167,15 @@ GOOGLE_NEWS_QUERIES = [
     "Sweden+startup+seed+investment",
     "Swedish+startup+secures+funding",
     "Nordic+startup+Sweden+raises",
+]
+
+DENMARK_GOOGLE_NEWS_QUERIES = [
+    "Denmark+startup+funding",
+    "Danish+startup+raises+million",
+    "Copenhagen+startup+investment+round",
+    "Danish+company+series+A+B+C+funding",
+    "Denmark+startup+seed+investment",
+    "Danish+startup+secures+funding",
 ]
 
 SOURCE_PRIORITY = {
@@ -309,19 +326,23 @@ def is_bad_title(title: str) -> bool:
 def is_norway_only(article: dict) -> bool:
     text = (article["title"] + " " + article["summary"]).lower()
     norway = ["oslo-based", "oslo based", "norwegian startup", "norway-based"]
-    return any(s in text for s in norway) and not any(k in text for k in SWEDEN_KEYWORDS)
+    nordic = SWEDEN_KEYWORDS + DENMARK_KEYWORDS
+    return any(s in text for s in norway) and not any(k in text for k in nordic)
 
 
 def passes_basic_filters(article: dict) -> bool:
     """
     Fast keyword-only pre-filter — no API calls.
     Articles that fail here are dropped immediately.
+    Now accepts both Swedish and Danish articles.
     """
     text = (article["title"] + " " + article["summary"]).lower()
     pub  = to_datetime(article["published"])
     if age_days(pub) > MAX_AGE_DAYS:
         return False
-    if not any(kw in text for kw in SWEDEN_KEYWORDS):
+    is_se = any(kw in text for kw in SWEDEN_KEYWORDS)
+    is_dk = any(kw in text for kw in DENMARK_KEYWORDS)
+    if not (is_se or is_dk):
         return False
     if not any(kw in text for kw in FUNDING_KEYWORDS):
         return False
@@ -331,13 +352,30 @@ def passes_basic_filters(article: dict) -> bool:
         return False
     return True
 
+
+def get_article_country(article: dict) -> str:
+    """Returns 'sweden', 'denmark', or 'both' based on keyword matching."""
+    text = (article["title"] + " " + article["summary"]).lower()
+    is_se = any(kw in text for kw in SWEDEN_KEYWORDS)
+    is_dk = any(kw in text for kw in DENMARK_KEYWORDS)
+    if is_se and is_dk:
+        return "both"
+    if is_dk:
+        return "denmark"
+    return "sweden"  # default to Sweden (original behaviour)
+
 # ── Funding extraction ────────────────────────────────────────────────────────
 
+# Extended to recognise SEK, DKK, MSEK, MDKK, Mkr, mio. kr
+# IMPORTANT: longer tokens (million, billion, msek …) must come before bare
+# single-letter variants (m, k) so the alternation doesn't consume "m" from
+# "million" and leave the rest unmatched.
 _AMOUNT_RE = re.compile(
-    r"([€£\$])\s*([\d]+(?:[.,]\d+)?)\s*(k|m|mn|million|bn|billion)?"
+    r"([€£\$])\s*([\d]+(?:[.,]\d+)?)\s*(billion|million|mn|bn\b|k\b|m\b)?"
     r"|"
-    r"([\d]+(?:[.,]\d+)?)\s*(million|billion|m\b|bn\b|k\b)\s*"
-    r"(?:euro[s]?|dollar[s]?|usd|sek|kr)?",
+    r"([\d]+(?:[.,]\d+)?)\s*"
+    r"(billion|million|mio\.?\s*kr|msek|mdkk|mkr|bn\b|k\b|m\b)\s*"
+    r"(?:sek|dkk|euro[s]?|dollar[s]?|usd|kr)?",
     re.IGNORECASE,
 )
 
@@ -369,16 +407,26 @@ def extract_funding_info(title: str, summary: str) -> tuple[str, str]:
                 num  = float(am.group(2).replace(",", "."))
                 unit = (am.group(3) or "").lower()
             else:
-                sym  = "€"
+                sym  = ""   # will be set by currency unit below
                 num  = float(am.group(4).replace(",", "."))
                 unit = (am.group(5) or "").lower()
+                # Detect Scandinavian currency symbols
+                full_match = am.group(0).lower()
+                if "sek" in full_match or "kr" in full_match:
+                    sym = "SEK "
+                elif "dkk" in full_match:
+                    sym = "DKK "
+                else:
+                    sym = "€"
 
             if unit in ("bn", "billion"):
                 amount_str = f"{sym}{num:g}B"
-            elif unit in ("m", "mn", "million"):
+            elif unit in ("m", "mn", "million", "msek", "mdkk", "mkr"):
                 amount_str = f"{sym}{num:g}M"
-            elif unit == "k":
+            elif unit in ("k",):
                 amount_str = f"{sym}{int(num)}K"
+            elif "mio" in unit:
+                amount_str = f"{sym}{num:g}M"
             else:
                 amount_str = f"{sym}{num:g}"
         except (ValueError, IndexError):
@@ -400,11 +448,12 @@ def _normalise_apostrophes(s: str) -> str:
 
 _PREFIX_RE = re.compile(
     r"""^(?:
-        sweden'?s?\s+               |
-        swedish\s+                  |
-        stockholm[\-\s]based\s+     |
-        gothenburg[\-\s]based\s+    |
-        nordic\s+                   |
+        (?:sweden|denmark)'?s?\s+       |
+        (?:swedish|danish)\s+           |
+        stockholm[\-\s]based\s+         |
+        gothenburg[\-\s]based\s+        |
+        copenhagen[\-\s]based\s+        |
+        nordic\s+                       |
         (?:ai|ml|data|tech|saas|fintech|deeptech|biotech|bio|medtech|nuclear|
            cleantech|healthtech|quantum|crypto|gaming|energy|insurtech|pet|
            micro|nano)\s+
@@ -480,35 +529,51 @@ def cluster_by_company(articles: list[dict]) -> list[dict]:
         result.append(best)
     return result
 
-# ── Email builder ─────────────────────────────────────────────────────────────
+# ── Email HTML builder ────────────────────────────────────────────────────────
 
-def build_html(articles: list[dict]) -> str:
-    today = datetime.now().strftime("%A, %d %B %Y")
+def _build_country_section(articles: list[dict], flag: str, name: str,
+                            header_bg: str) -> str:
+    """
+    Returns the HTML for one country section.
+    Produces BOTH a desktop table and mobile cards.
+
+    Desktop:  6-column table (shown by default; hidden on mobile via @media)
+    Mobile:   stacked cards  (hidden by default; shown on mobile via @media)
+
+    The inline style="display:none" on .mobile-cards means they are hidden
+    everywhere UNLESS a @media query overrides it — which Gmail mobile app,
+    Apple Mail, and Outlook.com all do. Desktop Gmail strips <style> blocks,
+    so the inline style keeps the cards hidden there, and the table shows
+    without interference.
+    """
     count = len(articles)
-    mode  = "Gemini 2.0 Flash" if _gemini_model else "regex fallback"
+    desktop_rows = ""
+    mobile_cards = ""
 
-    rows = ""
     for a in articles:
         pub      = to_datetime(a["published"])
         days_old = age_days(pub)
+        date_str = format_date(pub)
 
         fresh_badge = (
-            ' <span style="background:#22c55e;color:#fff;font-size:10px;'
+            '<span style="background:#22c55e;color:#fff;font-size:10px;'
             'padding:1px 6px;border-radius:8px;font-weight:bold;'
             'vertical-align:middle;margin-left:4px;">NEW</span>'
             if days_old <= FRESH_DAYS else ""
         )
         coverage_note = (
-            f' <span style="color:#9ca3af;font-size:11px;">({a["coverage"]} sources)</span>'
+            f'<span style="color:#9ca3af;font-size:11px;">({a["coverage"]} sources)</span>'
             if a.get("coverage", 1) > 1 else ""
         )
 
         amount, rnd = a.get("amount", ""), a.get("round", "")
         funding_parts = []
         if rnd:
-            funding_parts.append(f'<span style="font-weight:600;color:#374151;">{rnd}</span>')
+            funding_parts.append(
+                f'<span style="font-weight:600;color:#374151;">{rnd}</span>')
         if amount:
-            funding_parts.append(f'<span style="color:#059669;font-weight:700;">{amount}</span>')
+            funding_parts.append(
+                f'<span style="color:#059669;font-weight:700;">{amount}</span>')
         funding_html = (
             ' <span style="color:#d1d5db;">·</span> '.join(funding_parts)
             if funding_parts else
@@ -527,11 +592,12 @@ def build_html(articles: list[dict]) -> str:
         if not tags_html:
             tags_html = '<span style="color:#e5e7eb;font-size:11px;">—</span>'
 
-        rows += f"""
+        # ── Desktop table row ──────────────────────────────────────────────────
+        desktop_rows += f"""
         <tr style="border-bottom:1px solid #f3f4f6;">
           <td style="padding:11px 14px;vertical-align:top;min-width:130px;">
             <span style="font-weight:700;color:#111827;">{a['company']}</span>
-            {fresh_badge}{coverage_note}
+            {fresh_badge} {coverage_note}
             <br>
             <a href="{a.get('linkedin_url','#')}" target="_blank"
                style="font-size:11px;color:#6b7280;text-decoration:none;">
@@ -548,75 +614,175 @@ def build_html(articles: list[dict]) -> str:
           <td style="padding:11px 14px;vertical-align:top;font-size:12px;
                      color:#6b7280;white-space:nowrap;">{a['source']}</td>
           <td style="padding:11px 14px;vertical-align:top;font-size:12px;
-                     color:#6b7280;white-space:nowrap;">{format_date(pub)}</td>
+                     color:#6b7280;white-space:nowrap;">{date_str}</td>
         </tr>"""
 
-    no_results = """<tr><td colspan="6"
-        style="padding:32px;text-align:center;color:#9ca3af;font-size:14px;">
-        No new funding news matching your criteria today — check back tomorrow!
-        </td></tr>""" if not articles else ""
+        # ── Mobile card ────────────────────────────────────────────────────────
+        mobile_cards += f"""
+        <div style="background:#fff;border:1px solid #e5e7eb;border-radius:10px;
+                    margin-bottom:10px;padding:14px 16px;">
+          <div style="font-size:15px;font-weight:700;color:#111827;
+                      margin-bottom:2px;">
+            {a['company']} {fresh_badge}
+          </div>
+          {('<div style="font-size:11px;color:#9ca3af;margin-bottom:6px;">'
+            + str(a['coverage']) + ' sources</div>') if a.get('coverage', 1) > 1 else ''}
+          <div style="margin-bottom:6px;">{funding_html}</div>
+          <div style="margin-bottom:8px;">{tags_html}</div>
+          <div style="font-size:13px;line-height:1.5;margin-bottom:8px;">
+            <a href="{a['link']}" target="_blank"
+               style="color:#1d4ed8;text-decoration:none;">{a['title']}</a>
+          </div>
+          <div style="font-size:11px;color:#6b7280;">
+            <a href="{a.get('linkedin_url','#')}" target="_blank"
+               style="color:#6b7280;text-decoration:none;">🔗 LinkedIn</a>
+            &nbsp;·&nbsp; {a['source']} &nbsp;·&nbsp; {date_str}
+          </div>
+        </div>"""
+
+    no_results_row = (
+        f'<tr><td colspan="6" style="padding:32px;text-align:center;'
+        f'color:#9ca3af;font-size:14px;">No {name} funding news found today '
+        f'— check back tomorrow!</td></tr>'
+        if not articles else ""
+    )
+    no_results_card = (
+        f'<p style="text-align:center;color:#9ca3af;padding:24px 16px;">'
+        f'No {name} funding news found today.</p>'
+        if not articles else ""
+    )
+
+    return f"""
+  <!-- ════ {name} section ════ -->
+  <div style="background:{header_bg};color:#fff;padding:16px 32px;">
+    <span style="font-size:16px;font-weight:700;letter-spacing:-.2px;">
+      {flag}&nbsp; {name}
+      <span style="font-weight:400;opacity:.75;font-size:13px;">
+        &nbsp;— {count} compan{'ies' if count != 1 else 'y'}
+      </span>
+    </span>
+  </div>
+
+  <!-- Desktop table (hidden on mobile via CSS) -->
+  <div class="desktop-table">
+    <div style="overflow-x:auto;">
+      <table style="width:100%;border-collapse:collapse;font-size:14px;">
+        <thead>
+          <tr style="background:#f9fafb;border-bottom:2px solid #e5e7eb;">
+            <th style="padding:10px 14px;text-align:left;color:#6b7280;font-size:11px;
+                       text-transform:uppercase;letter-spacing:.06em;">Company</th>
+            <th style="padding:10px 14px;text-align:left;color:#6b7280;font-size:11px;
+                       text-transform:uppercase;letter-spacing:.06em;white-space:nowrap;">
+                       Round · Amount</th>
+            <th style="padding:10px 14px;text-align:left;color:#6b7280;font-size:11px;
+                       text-transform:uppercase;letter-spacing:.06em;">Domain</th>
+            <th style="padding:10px 14px;text-align:left;color:#6b7280;font-size:11px;
+                       text-transform:uppercase;letter-spacing:.06em;">Headline</th>
+            <th style="padding:10px 14px;text-align:left;color:#6b7280;font-size:11px;
+                       text-transform:uppercase;letter-spacing:.06em;">Source</th>
+            <th style="padding:10px 14px;text-align:left;color:#6b7280;font-size:11px;
+                       text-transform:uppercase;letter-spacing:.06em;">Date</th>
+          </tr>
+        </thead>
+        <tbody>{desktop_rows or no_results_row}</tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Mobile cards (hidden by default; revealed on mobile via @media) -->
+  <div class="mobile-cards" style="display:none;padding:12px 10px;">
+    {mobile_cards or no_results_card}
+  </div>"""
+
+
+def build_html(sweden_articles: list[dict], denmark_articles: list[dict]) -> str:
+    today    = datetime.now().strftime("%A, %d %B %Y")
+    se_count = len(sweden_articles)
+    dk_count = len(denmark_articles)
+    mode     = "Gemini 2.0 Flash" if _gemini_model else "regex fallback"
+
+    sweden_html  = _build_country_section(
+        sweden_articles,  "🇸🇪", "Sweden",  "#005B99")
+    denmark_html = _build_country_section(
+        denmark_articles, "🇩🇰", "Denmark", "#AE0523")
 
     return f"""<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:20px;background:#f3f4f6;font-family:Arial,sans-serif;">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    /*
+      Mobile-responsive email strategy:
+      - .desktop-table: shown by default (no inline display set); hidden on mobile via @media
+      - .mobile-cards:  hidden by default (inline style="display:none"); shown on mobile via @media
+
+      This works because:
+      - Desktop Gmail strips <style> blocks → inline display:none on cards hides them ✓
+      - Mobile Gmail app preserves <style> and fires @media → table hidden, cards shown ✓
+      - Apple Mail / Outlook.com: full @media support ✓
+      - Outlook desktop: ignores @media, falls back to inline styles (table shows) ✓
+    */
+    @media only screen and (max-width: 600px) {{
+      .email-outer  {{ padding: 4px !important; }}
+      .email-header {{ padding: 20px 16px !important; }}
+      .email-header h1 {{ font-size: 18px !important; }}
+      .email-tip    {{ padding: 8px 14px !important; font-size: 11px !important; }}
+      .desktop-table {{ display: none !important; }}
+      .mobile-cards  {{ display: block !important; }}
+    }}
+  </style>
+</head>
+<body class="email-outer"
+      style="margin:0;padding:20px;background:#f3f4f6;font-family:Arial,sans-serif;">
+
 <div style="max-width:1060px;margin:auto;background:#fff;border-radius:12px;
             overflow:hidden;box-shadow:0 2px 16px rgba(0,0,0,.08);">
 
-  <div style="background:#0d1b2a;color:#fff;padding:28px 32px;">
+  <!-- ── Master header ── -->
+  <div class="email-header"
+       style="background:#0d1b2a;color:#fff;padding:28px 32px;">
     <h1 style="margin:0 0 6px;font-size:22px;letter-spacing:-.3px;">
-      🇸🇪 Sweden Startup Funding Digest
+      🇸🇪🇩🇰 Nordic Startup Funding Digest
     </h1>
     <p style="margin:0;opacity:.65;font-size:13px;">
-      {today} &nbsp;·&nbsp; {count} unique compan{'ies' if count != 1 else 'y'}
-      &nbsp;·&nbsp; Any domain · All roles: Data · ML · Engineering · Quant
+      {today}
+      &nbsp;·&nbsp; {se_count} Swedish · {dk_count} Danish compan{'ies' if (se_count + dk_count) != 1 else 'y'}
+      &nbsp;·&nbsp; Data · ML · Engineering · Quant
     </p>
   </div>
 
-  <div style="background:#eff6ff;border-bottom:1px solid #dbeafe;
+  <!-- ── Tip bar ── -->
+  <div class="email-tip"
+       style="background:#eff6ff;border-bottom:1px solid #dbeafe;
               padding:10px 32px;font-size:12px;color:#1d4ed8;">
     💡 Click <strong>LinkedIn search</strong> under a company name to find
     founders and hiring managers directly
   </div>
 
-  <div style="overflow-x:auto;">
-    <table style="width:100%;border-collapse:collapse;font-size:14px;">
-      <thead>
-        <tr style="background:#f9fafb;border-bottom:2px solid #e5e7eb;">
-          <th style="padding:10px 14px;text-align:left;color:#6b7280;font-size:11px;
-                     text-transform:uppercase;letter-spacing:.06em;">Company</th>
-          <th style="padding:10px 14px;text-align:left;color:#6b7280;font-size:11px;
-                     text-transform:uppercase;letter-spacing:.06em;white-space:nowrap;">
-                     Round · Amount</th>
-          <th style="padding:10px 14px;text-align:left;color:#6b7280;font-size:11px;
-                     text-transform:uppercase;letter-spacing:.06em;">Domain</th>
-          <th style="padding:10px 14px;text-align:left;color:#6b7280;font-size:11px;
-                     text-transform:uppercase;letter-spacing:.06em;">Headline</th>
-          <th style="padding:10px 14px;text-align:left;color:#6b7280;font-size:11px;
-                     text-transform:uppercase;letter-spacing:.06em;">Source</th>
-          <th style="padding:10px 14px;text-align:left;color:#6b7280;font-size:11px;
-                     text-transform:uppercase;letter-spacing:.06em;">Date</th>
-        </tr>
-      </thead>
-      <tbody>{rows or no_results}</tbody>
-    </table>
-  </div>
+  {sweden_html}
 
+  <!-- ── Divider between sections ── -->
+  <div style="height:10px;background:#f3f4f6;"></div>
+
+  {denmark_html}
+
+  <!-- ── Footer ── -->
   <div style="background:#f9fafb;padding:16px 32px;font-size:12px;
               color:#9ca3af;border-top:1px solid #f3f4f6;">
-    🤖 Sweden Startup Funding Agent v6 ({mode}) &nbsp;·&nbsp;
+    🤖 Nordic Startup Funding Agent v7 ({mode}) &nbsp;·&nbsp;
     Sources: EU-Startups · ArcticStartup · Silicon Canals · Sifted · Tech.eu · Google News
   </div>
+
 </div>
 </body></html>"""
 
 # ── Email sender ──────────────────────────────────────────────────────────────
 
-def send_email(html: str, count: int) -> None:
+def send_email(html: str, se_count: int, dk_count: int) -> None:
     subject = (
-        f"🇸🇪 Sweden Startup Digest — {count} compan{'ies' if count != 1 else 'y'} "
-        f"| {datetime.now().strftime('%d %b %Y')}"
+        f"🇸🇪 {se_count} Swedish · 🇩🇰 {dk_count} Danish Startups"
+        f" | {datetime.now().strftime('%d %b %Y')}"
     )
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -626,12 +792,15 @@ def send_email(html: str, count: int) -> None:
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
         server.sendmail(GMAIL_ADDRESS, RECIPIENT_EMAIL, msg.as_string())
-    print(f"✅ Email sent — {count} companies — {datetime.now().strftime('%H:%M UTC')}")
+    print(
+        f"✅ Email sent — {se_count} Swedish + {dk_count} Danish companies"
+        f" — {datetime.now().strftime('%H:%M UTC')}"
+    )
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    print(f"🚀 Agent v6 — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"🚀 Agent v7 — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
     raw: list[dict] = []
 
@@ -640,12 +809,13 @@ def main() -> None:
         print(f"  [{name}] {len(articles)} articles")
         raw.extend(articles)
 
-    for query in GOOGLE_NEWS_QUERIES:
+    all_queries = GOOGLE_NEWS_QUERIES + DENMARK_GOOGLE_NEWS_QUERIES
+    for query in all_queries:
         raw.extend(fetch_google_news(query))
 
     print(f"📥 {len(raw)} raw articles")
 
-    # Step 1: fast keyword pre-filter (no API calls)
+    # Step 1: fast keyword pre-filter (no API calls) — now accepts SE + DK
     pre_filtered = [a for a in raw if passes_basic_filters(a)]
     print(f"🔍 {len(pre_filtered)} after basic keyword filters")
 
@@ -668,24 +838,36 @@ def main() -> None:
             print(f"  ✗ Dropped: {a['title'][:80]}")
     print(f"✅ {len(relevant)} relevant articles")
 
-    # Step 4: enrich — Gemini company name (or regex fallback) + tags + funding info
+    # Step 4: enrich — company name, tags, funding info, country tag
     print(f"🏷️  Extracting company names ({len(relevant)} articles)...")
     for a in relevant:
         a["company"]      = extract_company_name_llm(a["title"])
         a["linkedin_url"] = linkedin_url(a["company"])
         a["tags"]         = get_domain_tags(a)
         a["amount"], a["round"] = extract_funding_info(a["title"], a["summary"])
-        print(f"  → {a['company']!r:30s}  {a['title'][:60]}")
+        a["country"]      = get_article_country(a)
+        print(f"  → {a['company']!r:30s} [{a['country']:6s}]  {a['title'][:50]}")
 
-    # Step 5: cluster duplicates, sort, cap at 30
+    # Step 5: cluster duplicates
     clustered = cluster_by_company(relevant)
-    clustered.sort(key=lambda x: age_days(to_datetime(x["published"])))
-    final = clustered[:30]
 
-    print(f"📰 {len(final)} unique companies in digest")
+    # Step 6: split by country, sort by recency, cap at 30 each
+    sweden_list  = [a for a in clustered if a.get("country") in ("sweden",  "both")]
+    denmark_list = [a for a in clustered if a.get("country") in ("denmark", "both")]
 
-    html = build_html(final)
-    send_email(html, len(final))
+    sweden_list.sort( key=lambda x: age_days(to_datetime(x["published"])))
+    denmark_list.sort(key=lambda x: age_days(to_datetime(x["published"])))
+
+    sweden_final  = sweden_list[:30]
+    denmark_final = denmark_list[:30]
+
+    print(
+        f"📰 {len(sweden_final)} Swedish + {len(denmark_final)} Danish"
+        f" companies in digest"
+    )
+
+    html = build_html(sweden_final, denmark_final)
+    send_email(html, len(sweden_final), len(denmark_final))
 
 
 if __name__ == "__main__":
