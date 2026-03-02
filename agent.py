@@ -72,6 +72,9 @@ EXCLUDE_CONTENT_KEYWORDS = [
     "hair salon", "barbershop", "physical therapy", "massage", "catering company",
     "colocation", "hyperscaler", "megawatt", " mw ", "data center campus",
     "construction permit", "grid connection",
+    # Non-startup noise that slips through on regex-fallback runs
+    "cdc awards", "centers for disease control", "hepatitis", "vaccine study",
+    "fda official", "researchers with ties",
 ]
 
 # ── Regex fallbacks (used when Gemini is unavailable) ─────────────────────────
@@ -99,6 +102,14 @@ BAD_TITLE_PATTERNS = [
     r"(?:annual|weekly|monthly)\s+(?:roundup|digest|report)",
     r"startups?\s+(?:to\s+watch|you\s+should\s+know)",
     r"^(?:swedish|nordic|danish)\s+(?:ai[\-\s])?native\s+startups?",
+    # Listicles and aggregator pages (e.g. Tracxn "latest funding rounds, trends")
+    r"latest\s+funding\s+rounds?,?\s+trends?",
+    r"funding\s+rounds?\s+and\s+news",
+    r"startups?\s+in\s+(?:sweden|denmark|nordic).{0,30}(?:tracxn|crunchbase|dealroom)",
+    # Cohort / accelerator batch announcements (multiple companies, not one raise)
+    r"(?:\d+|five|six|seven|eight|nine|ten)\s+startups?\s+(?:enter|join|selected|graduate)",
+    r"\bcohort\b",
+    r"accelerator\s+(?:batch|cohort|program)",
 ]
 
 # ── Domain tags (informational only) ─────────────────────────────────────────
@@ -371,10 +382,15 @@ def get_article_country(article: dict) -> str:
 # single-letter variants (m, k) so the alternation doesn't consume "m" from
 # "million" and leave the rest unmatched.
 _AMOUNT_RE = re.compile(
-    r"([€£\$])\s*([\d]+(?:[.,]\d+)?)\s*(billion|million|mn|bn\b|k\b|m\b)?"
+    # Pattern 1: symbol-first  e.g.  €10M  $6.6B  £500K
+    # 'billion' before 'b\b' and 'million' before 'm\b' so longer tokens win.
+    # milli?o?n? handles "million", "millon" (missing i), "milion" (single l)
+    r"([€£\$])\s*([\d]+(?:[.,]\d+)?)\s*"
+    r"(billion|milli?o?n?|mn|bn\b|b\b|k\b|m\b)?"
     r"|"
+    # Pattern 2: number-first  e.g.  200 MSEK  50 million DKK  1.2 billion kr
     r"([\d]+(?:[.,]\d+)?)\s*"
-    r"(billion|million|mio\.?\s*kr|msek|mdkk|mkr|bn\b|k\b|m\b)\s*"
+    r"(billion|milli?o?n?|mio\.?\s*kr|msek|mdkk|mkr|bn\b|b\b|k\b|m\b)\s*"
     r"(?:sek|dkk|euro[s]?|dollar[s]?|usd|kr)?",
     re.IGNORECASE,
 )
@@ -419,9 +435,10 @@ def extract_funding_info(title: str, summary: str) -> tuple[str, str]:
                 else:
                     sym = "€"
 
-            if unit in ("bn", "billion"):
+            if unit in ("bn", "b", "billion"):
                 amount_str = f"{sym}{num:g}B"
-            elif unit in ("m", "mn", "million", "msek", "mdkk", "mkr"):
+            elif unit in ("m", "mn", "million", "milion", "millon",
+                          "msek", "mdkk", "mkr"):
                 amount_str = f"{sym}{num:g}M"
             elif unit in ("k",):
                 amount_str = f"{sym}{int(num)}K"
