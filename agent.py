@@ -276,17 +276,30 @@ def format_date(pub: datetime | None) -> str:
 
 def _gemini_call(prompt: str) -> str | None:
     """
-    Single Gemini API call. Returns response text or None on error.
-    A short sleep is added after each call to respect rate limits.
+    Single Gemini API call with automatic rate-limit backoff.
+
+    Free-tier limits for Gemini 2.0 Flash: 15 RPM / 1,500 RPD.
+    On a 429 (quota exceeded) we wait 60 s and retry once; any other
+    error returns None immediately so callers can fall back gracefully.
     """
-    try:
-        response = _gemini_model.generate_content(prompt)
-        time.sleep(0.5)          # ~120 RPM max — well within any tier limit
-        return response.text.strip()
-    except Exception as exc:
-        print(f"[Gemini] API error: {exc}")
-        time.sleep(1)            # back off briefly after an error
-        return None
+    for attempt in range(2):          # 2 attempts: initial + one retry
+        try:
+            response = _gemini_model.generate_content(prompt)
+            time.sleep(0.5)           # polite inter-call delay
+            return response.text.strip()
+        except Exception as exc:
+            err_str = str(exc)
+            is_rate_limit = ("429" in err_str or
+                             "quota" in err_str.lower() or
+                             "rate" in err_str.lower())
+            if is_rate_limit and attempt == 0:
+                print(f"[Gemini] Rate limit hit — waiting 60 s before retry …")
+                time.sleep(60)        # wait a full minute, then retry
+            else:
+                print(f"[Gemini] API error: {exc}")
+                time.sleep(1)
+                return None
+    return None
 
 
 def is_relevant_article_llm(title: str) -> bool:
@@ -337,6 +350,40 @@ def extract_company_name_llm(title: str) -> str:
     # Fallback if Gemini returned something implausible
     print(f"[Gemini name] Implausible result '{answer}' — using regex fallback")
     return extract_company_name(title)
+
+def can_hire_data_roles_llm(company: str, title: str, summary: str) -> bool:
+    """
+    Returns True if this company would plausibly hire Data Scientists,
+    ML / AI Engineers, or Data Engineers as it scales.
+
+    The prompt is intentionally permissive: most funded tech startups
+    eventually need these roles. We only return False for companies that
+    are clearly non-technical (physical services, food production, events).
+
+    Falls back to True (include) when Gemini is unavailable or errors,
+    so no company is silently dropped due to an API failure.
+    """
+    if _gemini_model is None:
+        return True     # no Gemini — include everything
+
+    prompt = (
+        "A funded startup is described below.\n"
+        "As it grows, would it plausibly hire Data Scientists, ML Engineers, "
+        "AI Engineers, or Data Engineers?\n"
+        "Most software, platform, and tech startups eventually need these roles "
+        "for analytics, ML features, data infrastructure, or AI products.\n"
+        "Answer 'No' ONLY if the company is clearly non-technical — e.g. a "
+        "restaurant, catering company, events organiser, hair salon, or a "
+        "business whose core product is entirely physical with no software.\n"
+        "Answer ONLY 'Yes' or 'No'. No explanation.\n\n"
+        f"Company: {company}\n"
+        f"Description: {title}. {summary[:300]}"
+    )
+    answer = _gemini_call(prompt)
+    if answer is None:
+        return True     # on error, include the company
+    return not answer.strip().lower().startswith("no")
+
 
 # ── Filters ───────────────────────────────────────────────────────────────────
 
@@ -558,21 +605,6 @@ _INVALID_COMPANY_RE = re.compile(
 def is_invalid_company_name(name: str) -> bool:
     return bool(_INVALID_COMPANY_RE.match(name.strip()))
 
-
-# ── Denmark target domains ─────────────────────────────────────────────────────
-# The Denmark section is filtered to companies in sectors likely to hire
-# Data Scientists, ML / AI Engineers, and Data Engineers.
-# Sweden is kept broad (user's preference).
-
-DENMARK_TARGET_DOMAINS = {
-    "AI/ML", "Data", "Fintech", "SaaS/Cloud",
-    "Cybersec", "HealthTech", "DeepTech", "Robotics",
-    # Energy and CleanTech platforms hire Data Scientists, ML Engineers, and
-    # Data Engineers heavily for grid optimisation, demand forecasting, and
-    # algorithmic energy trading — same profile as Flower, Polarium, ATO Energy
-    # in Sweden.
-    "Energy", "CleanTech",
-}
 
 # ── Clustering ────────────────────────────────────────────────────────────────
 
@@ -817,7 +849,8 @@ def build_html(sweden_articles: list[dict], denmark_articles: list[dict]) -> str
        style="background:#eff6ff;border-bottom:1px solid #dbeafe;
               padding:10px 32px;font-size:12px;color:#1d4ed8;">
     💡 Click <strong>LinkedIn search</strong> under a company name to find
-    founders and hiring managers directly
+    founders and hiring managers directly &nbsp;·&nbsp;
+    🔬 Companies screened by Gemini for <strong>Data · ML · AI · Engineering</strong> role potential
   </div>
 
   {sweden_html}
@@ -918,19 +951,29 @@ def main() -> None:
     # Step 5: cluster duplicates
     clustered = cluster_by_company(enriched)
 
-    # Step 6: split by country, sort by recency, cap at 30 each
+    # Step 6: split by country
     sweden_list  = [a for a in clustered if a.get("country") in ("sweden",  "both")]
     denmark_list = [a for a in clustered if a.get("country") in ("denmark", "both")]
 
-    # Denmark: keep only companies in sectors relevant to Data / ML / AI / Engineering roles
-    denmark_list = [
-        a for a in denmark_list
-        if any(tag in DENMARK_TARGET_DOMAINS for tag in a.get("tags", []))
-    ]
-    print(
-        f"🇩🇰 {len(denmark_list)} Danish companies after domain filter"
-        f" ({', '.join(sorted(DENMARK_TARGET_DOMAINS))})"
-    )
+    # Step 7: Gemini data-role filter
+    # For each unique company, ask Gemini whether it would plausibly hire
+    # Data Scientists, ML / AI Engineers, or Data Engineers as it scales.
+    # This replaces all keyword / domain-tag-based filtering.
+    # Falls back to True (include) if Gemini is unavailable.
+    print("🔬 Gemini data-role relevance check …")
+    def _data_role_filter(articles: list[dict], label: str) -> list[dict]:
+        kept = []
+        for a in articles:
+            if can_hire_data_roles_llm(a["company"], a["title"], a.get("summary", "")):
+                kept.append(a)
+                print(f"  ✓ {label} keep  : {a['company']!r}")
+            else:
+                print(f"  ✗ {label} drop  : {a['company']!r} — not data-role relevant")
+        return kept
+
+    sweden_list  = _data_role_filter(sweden_list,  "🇸🇪")
+    denmark_list = _data_role_filter(denmark_list, "🇩🇰")
+    print(f"  → {len(sweden_list)} Swedish + {len(denmark_list)} Danish after data-role filter")
 
     sweden_list.sort( key=lambda x: age_days(to_datetime(x["published"])))
     denmark_list.sort(key=lambda x: age_days(to_datetime(x["published"])))
