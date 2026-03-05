@@ -16,13 +16,14 @@ v7 changes over v6:
 import os
 import re
 import time
+import imaplib
 import smtplib
 import feedparser
 import google.generativeai as genai
 from bs4 import BeautifulSoup
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 from collections import defaultdict
 
@@ -31,8 +32,9 @@ GMAIL_ADDRESS      = os.environ["GMAIL_ADDRESS"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 RECIPIENT_EMAIL    = GMAIL_ADDRESS
 
-MAX_AGE_DAYS = 90
-FRESH_DAYS   = 3
+MAX_AGE_DAYS  = 90
+FRESH_DAYS    = 3
+CLEANUP_DAYS  = 10   # delete digest emails older than this many days
 
 # ── Gemini setup ──────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -891,6 +893,42 @@ def send_email(html: str, se_count: int, dk_count: int) -> None:
         f" — {datetime.now().strftime('%H:%M UTC')}"
     )
 
+# ── Email cleanup ─────────────────────────────────────────────────────────────
+
+def cleanup_old_emails() -> None:
+    """
+    Delete digest emails older than CLEANUP_DAYS from Inbox and Sent Mail.
+    Uses IMAP with the same Gmail App Password — no additional credentials needed.
+    Covers both old subject format ("Startup Digest") and current ("Startups").
+    """
+    cutoff     = datetime.now() - timedelta(days=CLEANUP_DAYS)
+    cutoff_str = cutoff.strftime("%d-%b-%Y")   # IMAP format: e.g. 23-Feb-2026
+    folders    = ["INBOX", "[Gmail]/Sent Mail"]
+    criteria   = f'(FROM "{GMAIL_ADDRESS}" BEFORE {cutoff_str} SUBJECT "Startup")'
+
+    try:
+        with imaplib.IMAP4_SSL("imap.gmail.com", 993) as mail:
+            mail.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+            total = 0
+            for folder in folders:
+                status, _ = mail.select(folder)
+                if status != "OK":
+                    print(f"[Cleanup] Skipping {folder} — not accessible")
+                    continue
+                status, data = mail.search(None, criteria)
+                if status != "OK" or not data[0]:
+                    print(f"[Cleanup] {folder}: nothing to delete")
+                    continue
+                msg_ids = data[0].split()
+                for mid in msg_ids:
+                    mail.store(mid, "+FLAGS", "\\Deleted")
+                mail.expunge()
+                total += len(msg_ids)
+                print(f"[Cleanup] {folder}: deleted {len(msg_ids)} old digest email(s)")
+            print(f"[Cleanup] Done — {total} email(s) removed (older than {CLEANUP_DAYS} days)")
+    except Exception as exc:
+        print(f"[Cleanup] Error: {exc}")
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -988,6 +1026,7 @@ def main() -> None:
 
     html = build_html(sweden_final, denmark_final)
     send_email(html, len(sweden_final), len(denmark_final))
+    cleanup_old_emails()
 
 
 if __name__ == "__main__":
