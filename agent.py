@@ -904,7 +904,7 @@ def cleanup_old_emails() -> None:
     cutoff     = datetime.now() - timedelta(days=CLEANUP_DAYS)
     cutoff_str = cutoff.strftime("%d-%b-%Y")   # IMAP format: e.g. 23-Feb-2026
     folders    = ["INBOX", "[Gmail]/Sent Mail"]
-    criteria   = f'(FROM "{GMAIL_ADDRESS}" BEFORE {cutoff_str} SUBJECT "Startup")'
+    criteria   = f'(FROM "{GMAIL_ADDRESS}" BEFORE {cutoff_str} SUBJECT "Danish Startups")'
 
     try:
         with imaplib.IMAP4_SSL("imap.gmail.com", 993) as mail:
