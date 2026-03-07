@@ -1,14 +1,13 @@
 """
-Nordic Startup Funding Agent  — v8
+Nordic Startup Funding Agent  — v9
 -----------------------------------
 Daily digest of Swedish and Danish startup funding news for job seekers targeting
 Data Scientist, ML Engineer, Data Engineer, and Quant Analyst roles.
 
-v8 changes over v7:
-- Combined 3 Gemini calls per article into 1 (relevance + company name + data-role in one JSON call)
-- Inter-call sleep raised to 4.1 s to respect Gemini 2.0 Flash 15 RPM free-tier limit
-- Eliminates 60-second rate-limit penalty waits; typical run time reduced from 20+ min to ~5 min
-- Auto-cleanup of old digest emails via IMAP (CLEANUP_DAYS = 10)
+v9 changes over v8:
+- Switched model from gemini-2.0-flash (0 free-tier quota) to gemini-3.1-flash-lite-preview
+  (15 RPM / 500 RPD on free tier — sufficient for 50 articles/day)
+- Updated log/email label to reflect new model name
 """
 
 import os
@@ -43,7 +42,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 if GEMINI_API_KEY:
     _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    print("✅ Gemini 2.0 Flash initialised (google.genai SDK)")
+    print("✅ Gemini 3.1 Flash Lite initialised (google.genai SDK)")
 else:
     _gemini_client = None
     print("⚠️  GEMINI_API_KEY not set — falling back to regex for all decisions")
@@ -291,7 +290,7 @@ def _gemini_call(prompt: str) -> str | None:
     """
     Single Gemini API call with automatic rate-limit backoff.
 
-    Free-tier limits for Gemini 2.0 Flash: 15 RPM / 1,500 RPD.
+    Free-tier limits for Gemini 3.1 Flash Lite: 15 RPM / 1,500 RPD.
 
     Daily quota exhaustion (limit: 0 / PerDay quota ID) is detected and causes
     an immediate fallback to regex for ALL remaining articles — no 60 s waits.
@@ -306,7 +305,7 @@ def _gemini_call(prompt: str) -> str | None:
     for attempt in range(2):          # 2 attempts: initial + one retry
         try:
             response = _gemini_client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-3.1-flash-lite-preview",
                 contents=prompt,
             )
             time.sleep(4.1)           # respect 15 RPM free-tier limit (60 s / 15 = 4 s)
@@ -340,7 +339,7 @@ def is_relevant_article_llm(title: str) -> bool:
     Returns True if the headline reports a new funding round / investment
     for a specific named company.
 
-    Uses Gemini 2.0 Flash when available; falls back to BAD_TITLE_PATTERNS
+    Uses Gemini 3.1 Flash Lite when available; falls back to BAD_TITLE_PATTERNS
     regex when Gemini is unavailable.
     """
     if _gemini_client is None:
@@ -362,7 +361,7 @@ def extract_company_name_llm(title: str) -> str:
     """
     Extracts the company name receiving funding from the headline.
 
-    Uses Gemini 2.0 Flash when available; falls back to regex chain
+    Uses Gemini 3.1 Flash Lite when available; falls back to regex chain
     when Gemini is unavailable or returns an implausible result.
     """
     if _gemini_client is None:
@@ -877,7 +876,7 @@ def build_html(sweden_articles: list[dict], denmark_articles: list[dict]) -> str
     today    = datetime.now().strftime("%A, %d %B %Y")
     se_count = len(sweden_articles)
     dk_count = len(denmark_articles)
-    mode     = "Gemini 2.0 Flash" if _gemini_client else "regex fallback"
+    mode     = "Gemini 3.1 Flash Lite" if _gemini_client else "regex fallback"
 
     sweden_html  = _build_country_section(
         sweden_articles,  "🇸🇪", "Sweden",  "#005B99")
