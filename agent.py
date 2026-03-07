@@ -17,6 +17,7 @@ import json
 import time
 import imaplib
 import smtplib
+import requests
 import feedparser
 import google.generativeai as genai
 from bs4 import BeautifulSoup
@@ -31,9 +32,11 @@ GMAIL_ADDRESS      = os.environ["GMAIL_ADDRESS"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 RECIPIENT_EMAIL    = GMAIL_ADDRESS
 
-MAX_AGE_DAYS  = 90
-FRESH_DAYS    = 3
-CLEANUP_DAYS  = 10   # delete digest emails older than this many days
+MAX_AGE_DAYS       = 90
+FRESH_DAYS         = 3
+CLEANUP_DAYS       = 10   # delete digest emails older than this many days
+MAX_GEMINI_ARTICLES = 50  # hard cap on articles sent to Gemini — keeps runtime ~5 min
+FEED_TIMEOUT        = 15  # seconds before giving up on a slow RSS/Google News feed
 
 # ── Gemini setup ──────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -216,7 +219,10 @@ SOURCE_PRIORITY = {
 def fetch_google_news(query: str) -> list[dict]:
     url = f"https://news.google.com/rss/search?q={query}&hl=en-SE&gl=SE&ceid=SE:en"
     try:
-        feed = feedparser.parse(url)
+        resp = requests.get(url, timeout=FEED_TIMEOUT,
+                            headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        feed = feedparser.parse(resp.content)
         results = []
         for entry in feed.entries[:20]:
             summary = BeautifulSoup(entry.get("summary", ""), "html.parser").get_text()
@@ -235,7 +241,10 @@ def fetch_google_news(query: str) -> list[dict]:
 
 def fetch_rss(url: str, source_name: str) -> list[dict]:
     try:
-        feed = feedparser.parse(url)
+        resp = requests.get(url, timeout=FEED_TIMEOUT,
+                            headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        feed = feedparser.parse(resp.content)
         results = []
         for entry in feed.entries[:30]:
             summary = BeautifulSoup(entry.get("summary", ""), "html.parser").get_text()
@@ -1011,6 +1020,15 @@ def main() -> None:
             seen_urls.add(a["link"])
             unique.append(a)
     print(f"🔗 {len(unique)} after URL deduplication")
+
+    # Sort by recency and cap before Gemini — keeps runtime predictable.
+    # Most recent articles are most valuable; older ones were likely processed
+    # in a previous day's digest anyway.
+    unique.sort(key=lambda a: age_days(to_datetime(a["published"])))
+    if len(unique) > MAX_GEMINI_ARTICLES:
+        print(f"⚠️  Capping to {MAX_GEMINI_ARTICLES} most recent articles "
+              f"(dropped {len(unique) - MAX_GEMINI_ARTICLES} older ones)")
+        unique = unique[:MAX_GEMINI_ARTICLES]
 
     # Steps 3+4+7 combined: single Gemini call per article
     # Each call returns relevance, company name, and data-role fit in one JSON response.
