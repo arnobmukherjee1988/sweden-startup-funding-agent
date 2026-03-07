@@ -1,20 +1,19 @@
 """
-Nordic Startup Funding Agent  — v7
+Nordic Startup Funding Agent  — v8
 -----------------------------------
 Daily digest of Swedish and Danish startup funding news for job seekers targeting
 Data Scientist, ML Engineer, Data Engineer, and Quant Analyst roles.
 
-v7 changes over v6:
-- Added Denmark as a second country section (Sweden first, Denmark second)
-- Fully mobile-responsive email: CSS media queries + card layout for phones
-- Country tagging: articles classified as 'sweden', 'denmark', or 'both'
-- SEK / DKK / kr currency support added to amount parser
-- Updated subject line to reflect both countries
-- Regex fallbacks unchanged
+v8 changes over v7:
+- Combined 3 Gemini calls per article into 1 (relevance + company name + data-role in one JSON call)
+- Inter-call sleep raised to 4.1 s to respect Gemini 2.0 Flash 15 RPM free-tier limit
+- Eliminates 60-second rate-limit penalty waits; typical run time reduced from 20+ min to ~5 min
+- Auto-cleanup of old digest emails via IMAP (CLEANUP_DAYS = 10)
 """
 
 import os
 import re
+import json
 import time
 import imaplib
 import smtplib
@@ -287,7 +286,7 @@ def _gemini_call(prompt: str) -> str | None:
     for attempt in range(2):          # 2 attempts: initial + one retry
         try:
             response = _gemini_model.generate_content(prompt)
-            time.sleep(0.5)           # polite inter-call delay
+            time.sleep(4.1)           # respect 15 RPM free-tier limit (60s / 15 = 4 s)
             return response.text.strip()
         except Exception as exc:
             err_str = str(exc)
@@ -385,6 +384,59 @@ def can_hire_data_roles_llm(company: str, title: str, summary: str) -> bool:
     if answer is None:
         return True     # on error, include the company
     return not answer.strip().lower().startswith("no")
+
+
+def analyse_article_llm(title: str, summary: str) -> dict | None:
+    """
+    Single Gemini call replacing the three separate calls for:
+      1. relevance check (is_relevant_article_llm)
+      2. company name extraction (extract_company_name_llm)
+      3. data-role hiring assessment (can_hire_data_roles_llm)
+
+    Returns a dict with keys:
+      relevant   (bool)  — does this report a new funding round for a named company?
+      company    (str)   — exact company name, or "" if not relevant
+      data_roles (bool)  — would this company plausibly hire data/ML/AI engineers?
+
+    Returns None if Gemini is unavailable or the response cannot be parsed,
+    so callers can fall back to regex logic.
+    """
+    if _gemini_model is None:
+        return None
+
+    prompt = (
+        "Analyse this startup news headline and answer three questions.\n"
+        "Return ONLY valid JSON — no explanation, no markdown, no code fences.\n\n"
+        "JSON keys required:\n"
+        '  "relevant":   true if the headline reports a NEW funding round, investment,\n'
+        '                or fundraise completed by a specific named company; else false.\n'
+        '  "company":    the exact company name that received funding (no descriptors\n'
+        '                like "Swedish" or "startup"); empty string "" if not relevant.\n'
+        '  "data_roles": true if, as this company scales, it would plausibly hire\n'
+        '                Data Scientists, ML Engineers, AI Engineers, or Data Engineers.\n'
+        '                Answer false ONLY for clearly non-technical businesses\n'
+        '                (restaurants, catering, events, hair salons, purely physical\n'
+        '                businesses with no software product).\n\n'
+        f"Headline: {title}\n"
+        f"Description: {summary[:250]}"
+    )
+    answer = _gemini_call(prompt)
+    if answer is None:
+        return None
+
+    # Strip accidental markdown code fences
+    clean = re.sub(r"^```[a-z]*\n?", "", answer.strip())
+    clean = re.sub(r"\n?```$", "", clean)
+    try:
+        result = json.loads(clean)
+        return {
+            "relevant":   bool(result.get("relevant",   False)),
+            "company":    str(result.get("company",     "")).strip(),
+            "data_roles": bool(result.get("data_roles", True)),
+        }
+    except (json.JSONDecodeError, KeyError, TypeError):
+        print(f"[Gemini] JSON parse error — raw response: {answer[:120]}")
+        return None
 
 
 # ── Filters ───────────────────────────────────────────────────────────────────
@@ -932,7 +984,7 @@ def cleanup_old_emails() -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    print(f"🚀 Agent v7 — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"🚀 Agent v8 — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
     raw: list[dict] = []
 
@@ -960,31 +1012,45 @@ def main() -> None:
             unique.append(a)
     print(f"🔗 {len(unique)} after URL deduplication")
 
-    # Step 3: Gemini relevance filter (or regex fallback)
-    print(f"🤖 Running relevance check ({len(unique)} articles)...")
-    relevant = []
-    for a in unique:
-        if is_relevant_article_llm(a["title"]):
-            relevant.append(a)
-        else:
-            print(f"  ✗ Dropped: {a['title'][:80]}")
-    print(f"✅ {len(relevant)} relevant articles")
-
-    # Step 4: enrich — company name, tags, funding info, country tag
-    print(f"🏷️  Extracting company names ({len(relevant)} articles)...")
+    # Steps 3+4+7 combined: single Gemini call per article
+    # Each call returns relevance, company name, and data-role fit in one JSON response.
+    # This replaces three separate API calls per article, cutting Gemini usage by ~3×.
+    # Inter-call sleep is 4.1 s to respect the 15 RPM free-tier limit and avoid
+    # 60-second rate-limit penalty waits.
+    print(f"🤖 Gemini analysis — 1 call per article ({len(unique)} articles) …")
     enriched = []
-    for a in relevant:
-        a["company"]      = extract_company_name_llm(a["title"])
-        a["linkedin_url"] = linkedin_url(a["company"])
-        a["tags"]         = get_domain_tags(a)
-        a["amount"], a["round"] = extract_funding_info(a["title"], a["summary"])
-        a["country"]      = get_article_country(a)
+    for a in unique:
+        analysis = analyse_article_llm(a["title"], a.get("summary", ""))
+
+        if analysis is None:
+            # Gemini unavailable or JSON unparseable — use regex fallbacks
+            if is_bad_title(a["title"]):
+                print(f"  ✗ Dropped (regex): {a['title'][:80]}")
+                continue
+            a["company"] = extract_company_name(a["title"])
+        else:
+            if not analysis["relevant"]:
+                print(f"  ✗ Not relevant: {a['title'][:80]}")
+                continue
+            if not analysis["data_roles"]:
+                print(f"  ✗ No data roles: {analysis['company'] or a['title'][:60]}")
+                continue
+            # Use Gemini-extracted name, fall back to regex if empty
+            a["company"] = analysis["company"] or extract_company_name(a["title"])
+
+        a["linkedin_url"]        = linkedin_url(a["company"])
+        a["tags"]                = get_domain_tags(a)
+        a["amount"], a["round"]  = extract_funding_info(a["title"], a["summary"])
+        a["country"]             = get_article_country(a)
+
         if is_invalid_company_name(a["company"]):
             print(f"  ✗ Bad company name {a['company']!r} — dropping: {a['title'][:60]}")
             continue
+
         enriched.append(a)
         print(f"  → {a['company']!r:30s} [{a['country']:6s}]  {a['title'][:50]}")
-    print(f"✅ {len(enriched)} articles after invalid-name filter")
+
+    print(f"✅ {len(enriched)} articles after Gemini filter")
 
     # Step 5: cluster duplicates
     clustered = cluster_by_company(enriched)
@@ -992,26 +1058,6 @@ def main() -> None:
     # Step 6: split by country
     sweden_list  = [a for a in clustered if a.get("country") in ("sweden",  "both")]
     denmark_list = [a for a in clustered if a.get("country") in ("denmark", "both")]
-
-    # Step 7: Gemini data-role filter
-    # For each unique company, ask Gemini whether it would plausibly hire
-    # Data Scientists, ML / AI Engineers, or Data Engineers as it scales.
-    # This replaces all keyword / domain-tag-based filtering.
-    # Falls back to True (include) if Gemini is unavailable.
-    print("🔬 Gemini data-role relevance check …")
-    def _data_role_filter(articles: list[dict], label: str) -> list[dict]:
-        kept = []
-        for a in articles:
-            if can_hire_data_roles_llm(a["company"], a["title"], a.get("summary", "")):
-                kept.append(a)
-                print(f"  ✓ {label} keep  : {a['company']!r}")
-            else:
-                print(f"  ✗ {label} drop  : {a['company']!r} — not data-role relevant")
-        return kept
-
-    sweden_list  = _data_role_filter(sweden_list,  "🇸🇪")
-    denmark_list = _data_role_filter(denmark_list, "🇩🇰")
-    print(f"  → {len(sweden_list)} Swedish + {len(denmark_list)} Danish after data-role filter")
 
     sweden_list.sort( key=lambda x: age_days(to_datetime(x["published"])))
     denmark_list.sort(key=lambda x: age_days(to_datetime(x["published"])))
