@@ -19,7 +19,7 @@ import imaplib
 import smtplib
 import requests
 import feedparser
-import google.generativeai as genai
+import google.genai as genai
 from bs4 import BeautifulSoup
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -42,11 +42,10 @@ FEED_TIMEOUT        = 15  # seconds before giving up on a slow RSS/Google News f
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    _gemini_model = genai.GenerativeModel("gemini-2.0-flash")
-    print("✅ Gemini 2.0 Flash initialised")
+    _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    print("✅ Gemini 2.0 Flash initialised (google.genai SDK)")
 else:
-    _gemini_model = None
+    _gemini_client = None
     print("⚠️  GEMINI_API_KEY not set — falling back to regex for all decisions")
 
 # ── Keyword filters ───────────────────────────────────────────────────────────
@@ -284,27 +283,51 @@ def format_date(pub: datetime | None) -> str:
 
 # ── Gemini helpers ────────────────────────────────────────────────────────────
 
+# Set to True if we detect daily quota exhaustion — skips all further Gemini calls
+_gemini_quota_exhausted = False
+
+
 def _gemini_call(prompt: str) -> str | None:
     """
     Single Gemini API call with automatic rate-limit backoff.
 
     Free-tier limits for Gemini 2.0 Flash: 15 RPM / 1,500 RPD.
-    On a 429 (quota exceeded) we wait 60 s and retry once; any other
-    error returns None immediately so callers can fall back gracefully.
+
+    Daily quota exhaustion (limit: 0 / PerDay quota ID) is detected and causes
+    an immediate fallback to regex for ALL remaining articles — no 60 s waits.
+
+    RPM rate limits (too many per minute) get one 60 s retry before giving up.
     """
+    global _gemini_quota_exhausted
+
+    if _gemini_client is None or _gemini_quota_exhausted:
+        return None
+
     for attempt in range(2):          # 2 attempts: initial + one retry
         try:
-            response = _gemini_model.generate_content(prompt)
-            time.sleep(4.1)           # respect 15 RPM free-tier limit (60s / 15 = 4 s)
+            response = _gemini_client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=prompt,
+            )
+            time.sleep(4.1)           # respect 15 RPM free-tier limit (60 s / 15 = 4 s)
             return response.text.strip()
         except Exception as exc:
             err_str = str(exc)
             is_rate_limit = ("429" in err_str or
                              "quota" in err_str.lower() or
                              "rate" in err_str.lower())
-            if is_rate_limit and attempt == 0:
-                print(f"[Gemini] Rate limit hit — waiting 60 s before retry …")
-                time.sleep(60)        # wait a full minute, then retry
+            is_daily_quota = ("PerDay" in err_str or
+                              "per_day" in err_str.lower() or
+                              "limit: 0" in err_str)
+
+            if is_daily_quota:
+                print("[Gemini] Daily quota exhausted — switching to regex "
+                      "fallback for all remaining articles (no further retries)")
+                _gemini_quota_exhausted = True
+                return None
+            elif is_rate_limit and attempt == 0:
+                print("[Gemini] RPM rate limit — waiting 60 s before retry …")
+                time.sleep(60)
             else:
                 print(f"[Gemini] API error: {exc}")
                 time.sleep(1)
@@ -320,7 +343,7 @@ def is_relevant_article_llm(title: str) -> bool:
     Uses Gemini 2.0 Flash when available; falls back to BAD_TITLE_PATTERNS
     regex when Gemini is unavailable.
     """
-    if _gemini_model is None:
+    if _gemini_client is None:
         return not is_bad_title(title)
 
     prompt = (
@@ -342,7 +365,7 @@ def extract_company_name_llm(title: str) -> str:
     Uses Gemini 2.0 Flash when available; falls back to regex chain
     when Gemini is unavailable or returns an implausible result.
     """
-    if _gemini_model is None:
+    if _gemini_client is None:
         return extract_company_name(title)
 
     prompt = (
@@ -373,7 +396,7 @@ def can_hire_data_roles_llm(company: str, title: str, summary: str) -> bool:
     Falls back to True (include) when Gemini is unavailable or errors,
     so no company is silently dropped due to an API failure.
     """
-    if _gemini_model is None:
+    if _gemini_client is None:
         return True     # no Gemini — include everything
 
     prompt = (
@@ -410,7 +433,7 @@ def analyse_article_llm(title: str, summary: str) -> dict | None:
     Returns None if Gemini is unavailable or the response cannot be parsed,
     so callers can fall back to regex logic.
     """
-    if _gemini_model is None:
+    if _gemini_client is None:
         return None
 
     prompt = (
@@ -854,7 +877,7 @@ def build_html(sweden_articles: list[dict], denmark_articles: list[dict]) -> str
     today    = datetime.now().strftime("%A, %d %B %Y")
     se_count = len(sweden_articles)
     dk_count = len(denmark_articles)
-    mode     = "Gemini 2.0 Flash" if _gemini_model else "regex fallback"
+    mode     = "Gemini 2.0 Flash" if _gemini_client else "regex fallback"
 
     sweden_html  = _build_country_section(
         sweden_articles,  "🇸🇪", "Sweden",  "#005B99")
