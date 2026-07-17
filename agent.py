@@ -1,41 +1,40 @@
 """
-Nordic Startup Funding Agent  — v9
+Nordic Startup Funding Agent  — v10
 -----------------------------------
 Daily digest of Swedish and Danish startup funding news for job seekers targeting
 Data Scientist, ML Engineer, Data Engineer, and Quant Analyst roles.
 
-v9 changes over v8:
-- Switched model from gemini-2.0-flash (0 free-tier quota) to gemini-3.1-flash-lite-preview
-  (15 RPM / 500 RPD on free tier — sufficient for 50 articles/day)
-- Updated log/email label to reflect new model name
-- Fixed RPM spike: moved time.sleep(4.1) to finally block so it always runs
-  on every attempt, not just on success
+v10 changes over v9:
+- Replaced Gmail SMTP + App Password with Resend API (resend.com)
+  App Passwords require 2-Step Verification and break silently when revoked;
+  Resend API keys never expire and require no Google account configuration.
+- Removed cleanup_old_emails() — it relied on Gmail IMAP which is no longer used.
+  Digests sent via Resend do not appear in Gmail Sent, so cleanup is a no-op.
+- Added RECIPIENT_EMAIL as an explicit env var (previously inferred from GMAIL_ADDRESS).
 """
 
 import os
 import re
 import json
 import time
-import imaplib
-import smtplib
 import requests
 import feedparser
+import resend
 import google.genai as genai
 from bs4 import BeautifulSoup
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 from collections import defaultdict
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-GMAIL_ADDRESS      = os.environ["GMAIL_ADDRESS"]
-GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-RECIPIENT_EMAIL    = GMAIL_ADDRESS
+RESEND_API_KEY  = os.environ["RESEND_API_KEY"]
+RECIPIENT_EMAIL = os.environ["RECIPIENT_EMAIL"]
+FROM_EMAIL      = os.environ.get("FROM_EMAIL", "onboarding@resend.dev")
 
-MAX_AGE_DAYS       = 90
-FRESH_DAYS         = 3
-CLEANUP_DAYS       = 10   # delete digest emails older than this many days
+resend.api_key = RESEND_API_KEY
+
+MAX_AGE_DAYS        = 90
+FRESH_DAYS          = 3
 MAX_GEMINI_ARTICLES = 50  # hard cap on articles sent to Gemini — keeps runtime ~5 min
 FEED_TIMEOUT        = 15  # seconds before giving up on a slow RSS/Google News feed
 
@@ -898,49 +897,16 @@ def send_email(html: str, se_count: int, dk_count: int) -> None:
         f"🇸🇪 {se_count} Swedish · 🇩🇰 {dk_count} Danish Startups"
         f" | {datetime.now().strftime('%d %b %Y')}"
     )
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = GMAIL_ADDRESS
-    msg["To"]      = RECIPIENT_EMAIL
-    msg.attach(MIMEText(html, "html"))
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-        server.sendmail(GMAIL_ADDRESS, RECIPIENT_EMAIL, msg.as_string())
+    resend.Emails.send({
+        "from":    FROM_EMAIL,
+        "to":      [RECIPIENT_EMAIL],
+        "subject": subject,
+        "html":    html,
+    })
     print(
         f"✅ Email sent — {se_count} Swedish + {dk_count} Danish companies"
         f" — {datetime.now().strftime('%H:%M UTC')}"
     )
-
-# ── Email cleanup ─────────────────────────────────────────────────────────────
-
-def cleanup_old_emails() -> None:
-    cutoff     = datetime.now() - timedelta(days=CLEANUP_DAYS)
-    cutoff_str = cutoff.strftime("%d-%b-%Y")
-    folders    = ["INBOX", "[Gmail]/Sent Mail"]
-    criteria   = f'(FROM "{GMAIL_ADDRESS}" BEFORE {cutoff_str} SUBJECT "Danish Startups")'
-
-    try:
-        with imaplib.IMAP4_SSL("imap.gmail.com", 993) as mail:
-            mail.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-            total = 0
-            for folder in folders:
-                status, _ = mail.select(folder)
-                if status != "OK":
-                    print(f"[Cleanup] Skipping {folder} — not accessible")
-                    continue
-                status, data = mail.search(None, criteria)
-                if status != "OK" or not data[0]:
-                    print(f"[Cleanup] {folder}: nothing to delete")
-                    continue
-                msg_ids = data[0].split()
-                for mid in msg_ids:
-                    mail.store(mid, "+FLAGS", "\\Deleted")
-                mail.expunge()
-                total += len(msg_ids)
-                print(f"[Cleanup] {folder}: deleted {len(msg_ids)} old digest email(s)")
-            print(f"[Cleanup] Done — {total} email(s) removed (older than {CLEANUP_DAYS} days)")
-    except Exception as exc:
-        print(f"[Cleanup] Error: {exc}")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -1028,7 +994,6 @@ def main() -> None:
 
     html = build_html(sweden_final, denmark_final)
     send_email(html, len(sweden_final), len(denmark_final))
-    cleanup_old_emails()
 
 
 if __name__ == "__main__":

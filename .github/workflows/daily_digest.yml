@@ -28,7 +28,7 @@ jobs:
 
       - name: Run funding agent
         env:
-          GMAIL_ADDRESS:      ${{ secrets.GMAIL_ADDRESS }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
+          RESEND_API_KEY:  ${{ secrets.RESEND_API_KEY }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          GEMINI_API_KEY:  ${{ secrets.GEMINI_API_KEY }}
         run: python agent.py
